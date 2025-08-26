@@ -1,0 +1,6 @@
+py-cord==2.6.1          # Discord bot framework (your fork of discord.py)
+yt-dlp==2025.8.11       # YouTube audio/video downloader
+python-dotenv==1.1.1    # Load .env with tokens & keys
+openai==1.99.1          # Only if Shabbot uses OpenAI API
+gTTS==2.5.4             # If you use text-to-speech commands
+requests==2.32.4        # If you make custom API/HTTP calls

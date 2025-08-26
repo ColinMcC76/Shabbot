@@ -32,3 +32,5 @@ ffmpeg/
 *.webm
 *.m4a
 "@ | Out-File .gitignore -Encoding utf8
+
+"discord/" 
