@@ -1,0 +1,5 @@
+# Normalize text files to LF in repo
+* text=auto
+
+# Python files should always be LF
+*.py text eol=lf

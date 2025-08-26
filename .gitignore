@@ -1,0 +1,34 @@
+@"
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Local configs/secrets
+*.env
+*.env.local
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+
+# Binaries & archives
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.exe
+*.dll
+*.so
+*.dylib
+
+# ffmpeg bundle (don’t version this)
+ffmpeg-master-*
+ffmpeg/
+
+# yt-dlp caches
+*.part
+*.webm
+*.m4a
+"@ | Out-File .gitignore -Encoding utf8
