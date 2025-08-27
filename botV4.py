@@ -1,10 +1,9 @@
-import os, tempfile, logging, platform, shutil
+import os, tempfile, logging, shutil
 import logging
-import asyncio
+import asyncio, json, time, audioop
 import subprocess
 import glob
 import base64
-import yt_dlp
 from io import BytesIO
 from collections import deque, defaultdict
 from zoneinfo import ZoneInfo
@@ -17,12 +16,31 @@ from discord.sinks.errors import SinkException
 from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
 from openai import OpenAI
+from websockets.asyncio.client import connect
+
 
 # -----------------------------------------------------------------------------
 # Setup & Config
 # -----------------------------------------------------------------------------
 load_dotenv()
+REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ====== 1) Audio plumbing ======
+# Discord voice expects 48kHz, stereo, s16le, 20ms frames (3840 bytes each).
+DISCORD_SR = 48000
+DISCORD_CH = 2
+BYTES_PER_SAMPLE = 2
+DISCORD_FRAME_MS = 20
+SAMPLES_PER_20MS = int(DISCORD_SR * DISCORD_FRAME_MS / 1000)           # 960 samples/ch
+FRAME_BYTES = SAMPLES_PER_20MS * DISCORD_CH * BYTES_PER_SAMPLE         # 3840 bytes
+FFMPEG_BIN = "/usr/bin/ffmpeg"  # adjust to your 'which ffmpeg'
 
+# We'll talk to the Realtime model at 24kHz mono for efficiency
+MODEL_SR = 24000
+MODEL_CH = 1
+# Realtime mic gating / commit cadence
+RMS_THRESH = 500       # adjust 300–900 depending on room noise/mic
+COMMIT_MS  = 200       # commit buffered audio every ~200ms if we sent frames
 # Per-user short memory
 conversation_memory: dict[str, deque] = defaultdict(lambda: deque(maxlen=6))
 
@@ -60,7 +78,6 @@ YTDLP_OPTS = {
     "nocheckcertificate": True,
     # these help avoid throttled/fragged URLs:
     "extractor_args": {"youtube": {"player_client": ["android"]}},
-    "cachedir":False,
 }
 
 FFMPEG_BEFORE_OPTS = (
@@ -416,139 +433,354 @@ async def equipmentchecksoundoff(ctx, *, descriptor: str = None):
 
 # ----------------------------- Speech-to-Speech ------------------------------
 
-@bot.command()
-async def s2s(ctx, record_seconds: int = 5):
-    """Record your mic for N seconds, transcribe, chat back, and speak the reply."""
-    # --- Ensure we're connected to the user's VC ---
-    vc: discord.VoiceClient = ctx.guild.voice_client
-    if not vc:
-        if not (ctx.author.voice and ctx.author.voice.channel):
-            return await ctx.send("🔊 Join a voice channel first.")
+class StreamingAudioSource(discord.AudioSource):
+    """
+    An AudioSource that pulls already-resampled 48k/stereo/16-bit PCM 20ms frames
+    from an asyncio.Queue and feeds Discord voice.
+    """
+    def __init__(self, frame_queue: asyncio.Queue):
+        self.queue = frame_queue
+        self._ended = False
+
+    def is_opus(self):
+        return False
+
+    def read(self):
+        # discord.AudioSource.read() is sync; block via loop.run_until_complete is unsafe.
+        # So we use a non-blocking approach: if nothing available, send silence.
         try:
-            vc = await ctx.author.voice.channel.connect(self_deaf=True)
-        except Exception as e:
-            logger.exception("VC connect failed")
-            return await ctx.send(f"❌ Could not join VC: `{e}`")
+            frame = self.queue.get_nowait()
+            return frame
+        except asyncio.QueueEmpty:
+            return b"\x00" * FRAME_BYTES  # short silence to avoid underrun
 
-    # --- Start recording ---
-    sink = SafeWaveSink()
-    finished = asyncio.Event()
+    def cleanup(self):
+        self._ended = True
 
-    async def _on_finish(_sink, _ctx):
-        finished.set()
 
-    await ctx.send(f"⏺️ Recording for {record_seconds}s…")
-    try:
-        vc.start_recording(sink, _on_finish, ctx)
-    except Exception as e:
-        logger.exception("start_recording failed")
-        return await ctx.send(f"❌ start_recording failed: `{e}`")
+def resample_mono_to_discord_stereo(mono_pcm_24k: bytes) -> bytes:
+    """
+    Take s16le mono @ 24k, resample to 48k, convert to stereo, return 20ms multiples.
+    We'll split into 20ms chunks after resample.
+    """
+    # Up-sample 24k -> 48k
+    # state=None returns (converted, newstate). We'll ignore state since we operate on 20ms multiples.
+    converted, _ = audioop.ratecv(mono_pcm_24k, BYTES_PER_SAMPLE, 1, MODEL_SR, DISCORD_SR, None)
+    # Mono -> Stereo (duplicate channel)
+    stereo = audioop.tostereo(converted, BYTES_PER_SAMPLE, 1, 1)
+    return stereo
 
-    # Record window
-    await asyncio.sleep(max(1, int(record_seconds)))
 
-    # Stop recording (guard for double-stop)
-    try:
-        vc.stop_recording()
-    except Exception as e:
-        logger.warning("stop_recording raised: %s", e)
-        return await ctx.send("❌ I wasn’t recording—did starting fail earlier?")
+def discord_20ms_chunks(stereo_48k_pcm: bytes):
+    for i in range(0, len(stereo_48k_pcm), FRAME_BYTES):
+        chunk = stereo_48k_pcm[i:i + FRAME_BYTES]
+        if len(chunk) == FRAME_BYTES:
+            yield chunk
 
-    # Wait for sink finalize with timeout
-    try:
-        await asyncio.wait_for(finished.wait(), timeout=10)
-    except asyncio.TimeoutError:
-        logger.error("Recording finish callback timeout")
-        return await ctx.send("⏱️ Recording took too long to finalize.")
 
-    # --- Extract audio from sink ---
-    if not getattr(sink, "audio_data", None):
-        return await ctx.send("📝 (no speech detected)")
+def downmix_discord_frame_to_model_mono(stereo_frame_48k: bytes) -> bytes:
+    """
+    Take one 20ms Discord frame (48k stereo) and convert to 24k mono for the model.
+    """
+    # stereo -> mono
+    mono_48k = audioop.tomono(stereo_frame_48k, BYTES_PER_SAMPLE, 0.5, 0.5)
+    # 48k -> 24k
+    mono_24k, _ = audioop.ratecv(mono_48k, BYTES_PER_SAMPLE, 1, DISCORD_SR, MODEL_SR, None)
+    return mono_24k
 
-    try:
-        # Pick first speaker’s audio
-        _, audio_data = next(iter(sink.audio_data.items()))
-        wav_bytes = audio_data.file.getvalue()
-    except Exception as e:
-        logger.exception("Failed to read sink audio")
-        return await ctx.send(f"❌ Failed to read audio: `{e}`")
 
-    # --- Transcribe ---
-    try:
-        text_in = await ai_transcribe(wav_bytes)
-    except Exception as e:
-        logger.exception("Transcription failed")
-        return await ctx.send(f"📝 Transcription failed: `{e}`")
+# ====== 2) Sink that streams frames as they arrive ======
+# ⬇️ replace the old RealtimeMicSink with this
 
-    if not text_in:
-        await ctx.send("📝 (no speech detected)")
-        text_in = "(No speech detected.)"
-    else:
-        await ctx.send(f"📝 You said: “{text_in}”")
+class RealtimeMicSink(discord.sinks.Sink):
+    def __init__(self, frame_queue, *, speaker_id=None, filters=None):
+        super().__init__(filters=filters)
+        self.frame_queue = frame_queue
+        self.speaker_id = speaker_id
+        self._buf = bytearray()
 
-    # --- Chat reply ---
-    try:
-        reply = await ai_chat(
-            "gpt-5",
-            messages=[
-                {"role": "system", "content": active_persona["system_prompt"]},
-                {"role": "user", "content": text_in},
-            ],
-            max_completion_tokens=400,
-        )
-    except Exception as e:
-        logger.exception("ai_chat failed")
-        reply = "I hit an error generating a reply."
+    def write(self, data, user, **kwargs):
+        # Ignore anyone who isn't the invoker (and definitely ignore the bot)
+        if self.speaker_id and getattr(user, "id", None) != self.speaker_id:
+            return
 
-    if not reply:
-        reply = "I didn't catch that."
+        pcm = getattr(data, "pcm", None) or data
+        if not pcm: return
 
-    # --- TTS synth to temp mp3 ---
-    try:
-        tts_bytes = await ai_tts(reply, voice=TTS_VOICE)
-    except Exception as e:
-        logger.exception("TTS failed")
-        return await ctx.send(f"🔇 TTS failed: `{e}`")
+        self._buf.extend(pcm)
+        while len(self._buf) >= FRAME_BYTES:
+            frame = bytes(self._buf[:FRAME_BYTES]); del self._buf[:FRAME_BYTES]
+            try: self.frame_queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                try: _ = self.frame_queue.get_nowait()
+                except: pass
+                try: self.frame_queue.put_nowait(frame)
+                except: pass
+# ====== 3) Global task registry for graceful stop ======
+_running_s2s = {
+    "ws": None,
+    "tasks": [],
+    "play_source": None,
+    "play_queue": None,
+    "mic_queue": None,
+}
 
-    try:
-        fd, out_path = tempfile.mkstemp(prefix=f"shabbot_{ctx.author.id}_", suffix=".mp3")
-        with os.fdopen(fd, "wb") as f:
-            f.write(tts_bytes)
-    except Exception as e:
-        logger.exception("Temp file write failed")
-        return await ctx.send(f"💾 Could not write audio: `{e}`")
+def _clear_running():
+    for k in list(_running_s2s.keys()):
+        _running_s2s[k] = None
+    _running_s2s["tasks"] = []
 
-    # --- Play via ffmpeg ---
+
+# ====== 4) The command: true realtime S2S ======
+@bot.command(name="s2s")
+async def s2s(ctx):
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.send("🔊 Join a voice channel first.")
+s2s
+    vc = ctx.voice_client
+    if not vc:
+        vc = await ctx.author.voice.channel.connect(self_deaf=False,self_mute=False)
+
     if vc.is_playing():
         vc.stop()
 
-    def _after_play(err: Exception | None):
-        try:
-            if err:
-                logger.error("Playback error: %s", err)
-        finally:
-            try:
-                os.remove(out_path)
-                logger.info("Cleaned temp %s", out_path)
-            except Exception as e2:
-                logger.warning("Temp cleanup failed (%s): %s", out_path, e2)
+    await ctx.send("🎤 Realtime started. Speak normally; I’ll talk back.")
 
-    try:
-        source = discord.FFmpegPCMAudio(
-            out_path,
-            executable=FFMPEG_BIN,
-            before_options=FFMPEG_BEFORE,
-            options=FFMPEG_OPTS,
-        )
-        vc.play(discord.PCMVolumeTransformer(source, volume=0.9), after=_after_play)
-        await ctx.send(f"🗣️ {reply[:180]}{'…' if len(reply) > 180 else ''}")
-    except Exception as e:
-        logger.exception("FFmpeg playback failed")
+    # --- WebSocket connect
+    ws = await connect(
+        REALTIME_URL,
+        additional_headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "OpenAI-Beta": "realtime=v1"
+        }
+    )
+    _running_s2s["ws"] = ws
+
+    # --- Session update: enable voice + server VAD
+    await ws.send(json.dumps({
+        "type": "session.update",
+        "session": {
+            "modalities": ["audio", "text"],
+            "voice": "verse",
+            "turn_detection": {"type": "server_vad"},
+            "instructions": "You are a concise, helpful Discord voice assistant."
+        }
+    }))
+
+    # --- Queues
+    mic_queue = asyncio.Queue(maxsize=100)        # incoming 20ms Discord frames
+    play_queue = asyncio.Queue(maxsize=200)       # outgoing 20ms Discord frames (already 48k/stereo)
+    _running_s2s["mic_queue"] = mic_queue
+    _running_s2s["play_queue"] = play_queue
+
+    # --- Start recording from VC with our realtime sink
+    sink = RealtimeMicSink(mic_queue,speaker_id=ctx.author.id)
+    finished = asyncio.Event()
+    async def _on_finish(_sink, _ctx):
+        finished.set()
+    vc.start_recording(sink, _on_finish, ctx)  # continuous until we stop
+
+    # --- Playback source from queue
+    play_source = StreamingAudioSource(play_queue)
+    _running_s2s["play_source"] = play_source
+    vc.play(play_source)
+
+    # --- Throttled message edit state
+    last_edit = 0.0
+    text_buf = []
+    text_msg = await ctx.send("**Bot:** _listening…_")
+
+    # ---------- TASKS ----------
+
+   async def reader_task():
+    nonlocal last_edit, text_buf, text_msg
+    async for raw in ws:
+        evt = json.loads(raw)
+        t = evt.get("type")
+        # print("[ws<-]", t)  # optional debug
+
+        if t == "response.started":
+            # New assistant turn is beginning—cut off anything still queued to play
+            await _flush_play_queue(play_queue)
+
+        elif t == "response.output_text.delta":
+            text_buf.append(evt.get("delta", ""))
+            now = time.time()
+            # Throttle message edits to ~4/sec
+            if now - last_edit >= 0.25:
+                last_edit = now
+                out = "".join(text_buf).strip()
+                if out:
+                    try:
+                        await text_msg.edit(content=f"**Bot:** {out}")
+                    except discord.HTTPException:
+                        pass
+
+        elif t == "response.output_audio.delta":
+            # Base64 PCM (24 kHz mono) → 48 kHz stereo → 20 ms frames
+            chunk = base64.b64decode(evt["audio"])
+            stereo_48k = resample_mono_to_discord_stereo(chunk)
+            for frame in discord_20ms_chunks(stereo_48k):
+                try:
+                    await play_queue.put(frame)
+                except asyncio.QueueFull:
+                    # Drop oldest to keep latency low
+                    try:
+                        _ = play_queue.get_nowait()
+                        await play_queue.put(frame)
+                    except asyncio.QueueEmpty:
+                        pass
+
+        elif t == "response.completed":
+            # Final text flush
+            out = "".join(text_buf).strip()
+            if out:
+                try:
+                    await text_msg.edit(content=f"**Bot:** {out}")
+                except discord.HTTPException:
+                    pass
+            text_buf.clear()
+
+        elif t in ("response.canceled", "response.interrupted", "response.truncated"):
+            # If the model stops mid-utterance (barge-in, cancel, length), clear any queued audio
+            await _flush_play_queue(play_queue)
+
+        elif t == "response.error":
+            err = evt.get("error", {}).get("message", "unknown error")
+            await ctx.send(f"⚠️ Realtime error: {err}")
+
+    async def mic_task():
+    last_commit = time.time()
+    sent_frames_since_commit = 0
+
+    while True:
+        frame_48k = await mic_queue.get()
+        if frame_48k is None:
+            break
+
+        mono_24k = downmix_discord_frame_to_model_mono(frame_48k)
+        if audioop.rms(mono_24k, 2) < RMS_THRESH:
+            # too quiet; skip
+            continue
+
+        b64 = base64.b64encode(mono_24k).decode("ascii")
+        await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
+        sent_frames_since_commit += 1
+
+        if (time.time() - last_commit) * 1000 >= COMMIT_MS:
+            if sent_frames_since_commit > 0:
+                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                sent_frames_since_commit = 0
+            last_commit = time.time()
+            
+    async def keepalive_task():
+        # Some WS libs auto-pong; this helps keep the TCP alive too.
+        while True:
+            if ws.closed:
+                break
+            try:
+                await ws.ping()
+            except Exception:
+                break
+            await asyncio.sleep(15)
+
+    # Register tasks for stop
+    t_reader = asyncio.create_task(reader_task(), name="s2s_reader")
+    t_mic    = asyncio.create_task(mic_task(),    name="s2s_mic")
+    t_ka     = asyncio.create_task(keepalive_task(), name="s2s_keepalive")
+    _running_s2s["tasks"] = [t_reader, t_mic, t_ka]
+
+    # Inform
+    await ctx.send("🟢 Live. Say something!")
+
+@bot.command(name="s2sstop")
+
+async def s2sstop(ctx):
+    """Graceful stop for the realtime session."""
+    ws          = _running_s2s.get("ws")
+    tasks       = list(_running_s2s.get("tasks") or [])
+    play_source = _running_s2s.get("play_source")
+    play_queue  = _running_s2s.get("play_queue")
+    mic_queue   = _running_s2s.get("mic_queue")
+
+    vc = ctx.voice_client
+
+    # 1) Stop Discord recording & playback safely
+    if vc:
+        # Stop recording if supported by your fork
+        if getattr(vc, "recording", False):
+            try:
+                vc.stop_recording()
+            except Exception:
+                pass
+
+        # Stop playback
+        if vc.is_playing():
+            try:
+                vc.stop()
+            except Exception:
+                pass
+
+    # Let our custom source clean up and unhook
+    if play_source:
         try:
-            os.remove(out_path)
-        except: pass
-        await ctx.send(f"🔇 Playback failed: `{e}`")
-        
+            play_source.cleanup()
+        except Exception:
+            pass
+
+    # Optional: push sentinels to queues so any waiting consumers can exit gracefully
+    for q in (play_queue, mic_queue):
+        try:
+            if q is not None:
+                q.put_nowait(None)
+        except Exception:
+            pass
+
+    # 2) Cancel running tasks and *await* their completion
+    for t in tasks:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    if tasks:
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception:
+            # We used return_exceptions=True, but be extra safe
+            pass
+
+    # 3) Close the realtime websocket cleanly
+    if ws and not getattr(ws, "closed", False):
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        # some clients require an explicit wait
+        try:
+            await ws.wait_closed()
+        except Exception:
+            pass
+
+    # 4) (Optional) Disconnect from voice channel if you want a full teardown
+    # if vc and vc.is_connected():
+    #     try:
+    #         await vc.disconnect(force=True)
+    #     except Exception:
+    #         pass
+
+    _clear_running()
+    await ctx.send("⛔ Realtime stopped.")
+
+async def _flush_play_queue(play_queue: asyncio.Queue):
+    try:
+        while True:
+            item = play_queue.get_nowait()
+            if item is None:
+                # keep sentinel for other consumers if you want, or just drop it
+                continue
+    except asyncio.QueueEmpty:
+        pass
+
 # ------------------------------- Speak Text ----------------------------------
 @bot.command()
 async def speak(ctx, *, text: str):
@@ -808,7 +1040,7 @@ async def _play_next_in_queue(ctx):
         print("Stage unsuppress failed:", e)
 
     # Build robust FFmpeg source (reconnects + protocol whitelist) and wrap with volume
-    ffmpeg_bin = os.getenv("FFMPEG_BIN")  # e.g., C:/ffmpeg/bin/ffmpeg.exe
+    ffmpeg_bin = "/usr/bin/ffmpeg"
     source = discord.FFmpegPCMAudio(
         url,
         executable=ffmpeg_bin if ffmpeg_bin else None,
@@ -833,139 +1065,11 @@ async def _play_next_in_queue(ctx):
         await ctx.send(f"▶️ **Now playing:** {title}\n🔗 {webpage_url}")
     except Exception:
         pass
-# Play youtube links
-# ---------- Constants ----------
-FFMPEG_BEFORE_OPTS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-FFMPEG_OPTIONS = "-vn"
 
-YTDLP_OPTS = {
-    # pick best audio; prefer m4a/webm but allow HLS/dash (FFmpeg handles it)
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "default_search": "auto",
-    "skip_download": True,
-    "nocheckcertificate": True,
-    # CRITICAL: force web client to avoid Android GVS PO token warning
-    "extractor_args": {"youtube": {"player_client": ["android"]}},
-    "cachedir": False,
-}
-
-# ---------- Paths / Source ----------
-def get_ffmpeg_path():
-    # 1) env var
-    env = os.getenv("FFMPEG_BIN")
-    if env and shutil.which(env):
-        return env
-
-    # 2) which on PATH (best cross-platform check)
-    wh = shutil.which("ffmpeg")
-    if wh:
-        return wh
-
-    # 3) OS fallbacks
-    system = platform.system().lower()
-    candidates = []
-    if system == "windows":
-        candidates += [
-            r"C:\ffmpeg\bin\ffmpeg.exe",
-            r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-            r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
-        ]
-    else:
-        candidates += ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-
-    for c in candidates:
-        if c and shutil.which(c):
-            return c
-
-    raise RuntimeError(
-        "FFmpeg not found. Install it (e.g., `sudo apt install ffmpeg libopus0`) "
-        "or set FFMPEG_BIN to the full path."
-    )
-
-def make_audio_source(url: str) -> discord.FFmpegPCMAudio:
-    ffmpeg_path = get_ffmpeg_path()
-    return discord.FFmpegPCMAudio(
-        url,
-        executable=ffmpeg_path,
-        before_options=FFMPEG_BEFORE_OPTS,
-        options=FFMPEG_OPTIONS,
-    )
-
-def get_stream(url_or_query: str):
-    """Return (title, stream_url, webpage_url)."""
-    with yt_dlp.YoutubeDL(YTDLP_OPTS) as ydl:
-        info = ydl.extract_info(url_or_query, download=False)
-        if not info:
-            raise RuntimeError("No extractable info.")
-
-        if "entries" in info and info["entries"]:
-            info = info["entries"][0]
-
-        title = info.get("title") or "Unknown Title"
-        stream_url = info.get("url")  # may be HLS or direct; FFmpeg can handle both
-        webpage_url = info.get("webpage_url") or url_or_query
-
-        if not stream_url:
-            raise RuntimeError("No playable stream URL from yt-dlp.")
-        return title, stream_url, webpage_url
-
-# ---------- Simple in-memory queue ----------
-from collections import defaultdict, deque
-_guild_queues = defaultdict(deque)
-
-def _get_queue(guild_id: int) -> deque:
-    return _guild_queues[guild_id]
-
-async def _play_next_in_queue(ctx):
-    vc = ctx.voice_client
-    if not vc or not vc.is_connected():
-        return
-
-    q = _get_queue(ctx.guild.id)
-    if not q:
-        return
-
-    title, stream_url, page = q[0]  # peek; pop when playback actually starts
-
-    try:
-        source = make_audio_source(stream_url)
-    except Exception as e:
-        q.popleft()
-        await ctx.send(f"❌ FFmpeg problem: {e}")
-        return await _play_next_in_queue(ctx)
-
-    # Wrap in volume transformer so /volume works
-    audio = discord.PCMVolumeTransformer(source, volume=0.9)
-
-    def _after_playback(err):
-        # Always advance the queue; report errors in channel thread
-        try:
-            q.popleft()
-        except Exception:
-            pass
-        # schedule next on the event loop
-        fut = asyncio.run_coroutine_threadsafe(_play_next_in_queue(ctx), vc.loop)
-        try:
-            fut.result()
-        except Exception:
-            pass
-
-    try:
-        vc.play(audio, after=_after_playback)
-        await ctx.send(f"🎶 Now playing: **{title}**")
-    except Exception as e:
-        # If play() fails, drop this item and move on
-        q.popleft()
-        await ctx.send(f"❌ Could not start playback: {e}")
-        await _play_next_in_queue(ctx)
-
-# ---------- Commands ----------
 @bot.command(name="playyt")
 async def playyt(ctx, *, url: str):
-    """Play/queue audio from YouTube (or any yt-dlp source)."""
-    # Join/move to user's VC
+    """Play audio from a YouTube (or yt-dlp supported) URL. Queues if already playing."""
+    # join/move to the user's VC
     vc = ctx.voice_client
     if not vc:
         if not ctx.author.voice or not ctx.author.voice.channel:
@@ -974,14 +1078,67 @@ async def playyt(ctx, *, url: str):
     elif ctx.author.voice and vc.channel != ctx.author.voice.channel:
         await vc.move_to(ctx.author.voice.channel)
 
-    # Extract stream
+    # yt-dlp extraction
+    info, fmts, title, webpage_url, direct_url = None, [], "Unknown Title", url, None
     try:
-        title, stream_url, page = get_stream(url)
+        with YoutubeDL({
+            "format": "bestaudio[ext=m4a]/bestaudio[acodec^=opus]/bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "default_search": "auto",
+            "skip_download": True,
+            "nocheckcertificate": True,
+            "extractor_args": {"youtube": {"player_client": ["android"]}},
+        }) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if not info:
+            return await ctx.send("❌ Could not retrieve info for that link.")
+
+        # Handle playlists/search results
+        if "entries" in info and info["entries"]:
+            info = info["entries"][0]
+
+        title = info.get("title", title)
+        webpage_url = info.get("webpage_url") or webpage_url
+        fmts = info.get("formats") or []
+
+        # Prefer non-HLS audio-only direct file streams
+        def _is_non_hls_audio(f):
+            proto = (f.get("protocol") or "")
+            return (
+                (f.get("acodec") not in (None, "none")) and
+                (f.get("vcodec") in (None, "none")) and
+                (f.get("url") not in (None, "")) and
+                not proto.startswith(("m3u8", "http_dash_segments"))
+            )
+
+        audio_fmts = [f for f in fmts if _is_non_hls_audio(f)]
+
+        def _rank(f):
+            ext = (f.get("ext") or "").lower()
+            abr = f.get("abr") or 0
+            return (0 if ext == "m4a" else (1 if ext == "webm" else 2), -abr)
+
+        if audio_fmts:
+            audio_fmts.sort(key=_rank)
+            direct_url = audio_fmts[0].get("url")
+
+        # Fallback: try top-level url if not HLS
+        if not direct_url:
+            candidate = info.get("url")
+            if candidate and not str(candidate).endswith(".m3u8"):
+                direct_url = candidate
+
+        if not direct_url:
+            return await ctx.send("❌ Could not get a playable audio URL (non-HLS). Try another link.")
+
     except Exception as e:
         return await ctx.send(f"❌ yt-dlp error: {e}")
 
+    # enqueue and play/continue
     q = _get_queue(ctx.guild.id)
-    q.append((title, stream_url, page))
+    q.append((title, direct_url, webpage_url))
 
     if not vc.is_playing() and not vc.is_paused():
         await _play_next_in_queue(ctx)
