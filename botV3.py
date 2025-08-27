@@ -1,4 +1,4 @@
-import os, tempfile, logging, platform, shutil
+import os, tempfile, logging, platform, shutil, re, collections
 import logging
 import asyncio
 import subprocess
@@ -680,11 +680,41 @@ async def _chat41(messages, *, max_tokens=2000, temperature=0.7) -> str:
     resp = await asyncio.to_thread(_call)
     return (resp.choices[0].message.content or "").strip() or "🤖 I couldn’t generate a reply."
 
-async def _chat5(messages, *, max_completion_tokens=600) -> str:
-    try:
-        return await ai_chat("gpt-5", messages=messages, max_completion_tokens=max_completion_tokens)
-    except Exception:
-        return await ai_chat("gpt-5-mini", messages=messages, max_completion_tokens=max_completion_tokens)
+# Example _chat5 using Responses API
+async def _chat5(messages, *, max_completion_tokens=2000, temperature=0.7) -> str:
+    # Convert chat "messages" to a single prompt block for Responses API
+    # (Supports multimodal by passing a list to "content" where needed.)
+    # System message becomes "metadata" or a system item up front.
+    sys = None
+    items = []
+    for m in messages:
+        role = m["role"]
+        if role == "system" and sys is None:
+            sys = m["content"]
+            continue
+        items.append({"role": role, "content": m["content"]})
+
+    def _call():
+        return client.responses.create(
+            model="gpt-5.1-mini",  # or your target model
+            temperature=temperature,
+            max_output_tokens=max_completion_tokens,
+            input=[
+                {"role": "system", "content": sys} if sys else None,
+                *items
+            ],
+        )
+    resp = await asyncio.to_thread(_call)
+
+    # Extract the first text segment safely
+    out = []
+    for item in getattr(resp, "output", []) or []:
+        if item["type"] == "message":
+            for c in item["content"]:
+                if c["type"] == "output_text":
+                    out.append(c["text"])
+    text = "".join(out).strip()
+    return text or "🤖 I couldn’t generate a reply."
 
 async def chat5_complete(messages, *, max_completion_tokens=1200, max_rounds=2) -> str:
     full = ""
@@ -719,68 +749,86 @@ async def forget(ctx):
 async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
+
+    # Ensure command processing still works
     await bot.process_commands(message)
 
-    if bot.user in message.mentions:
-        async with message.channel.typing():
-            try:
-                source_msg = message
-                if message.reference:
-                    try:
-                        referenced = await message.channel.fetch_message(message.reference.message_id)
-                        source_msg = referenced
-                    except Exception:
-                        pass
+    # Only respond when bot is mentioned
+    if bot.user not in message.mentions:
+        return
 
-                msgs = [{"role": "system", "content": active_persona["system_prompt"]}]
-                prior = list(channel_history.get(message.channel.id, []))
-                if prior:
-                    msgs.extend(prior)
+    # Per-channel rolling history (safe on first use)
+    hist = channel_history.setdefault(message.channel.id, collections.deque(maxlen=20))
 
-                if source_msg.attachments:
-                    attachment = source_msg.attachments[0]
-                    filename = attachment.filename.lower()
+    async with message.channel.typing():
+        try:
+            # If replying to another message, use that as the source
+            source_msg = message
+            if message.reference:
+                try:
+                    source_msg = await message.channel.fetch_message(message.reference.message_id)
+                except Exception:
+                    pass
 
-                    if filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
-                        image_bytes = await attachment.read()
-                        b64 = encode_image_to_base64(image_bytes)
-                        user_content = [
-                            {"type": "text", "text": "Analyze the visual content in a methodical, clinical way. Describe subjects, behavior, surroundings, and time of day as if for evidence."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                        ]
-                        channel_history[message.channel.id].append({"role": "user", "content": "[User sent an image for analysis]"})
-                        msgs.append({"role": "user", "content": user_content})
+            # Build messages for the model
+            msgs = [{"role": "system", "content": active_persona["system_prompt"]}]
+            prior = list(hist)
+            if prior:
+                msgs.extend(prior)
 
-                    elif filename.endswith((".mp4", ".mov", ".webm", ".gif")):
-                        path = await download_media(attachment)
-                        frames = await asyncio.to_thread(extract_frames, path, 5)
-                        if not frames:
-                            return await message.reply("❌ Could not extract frames from the video. Check file integrity.")
-                        user_content = [{"type": "text", "text": "Video sampled at ~1 FPS. Analyze clinically like evidence."}]
-                        for frame in frames:
-                            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image_to_base64(frame)}"}})
-                        channel_history[message.channel.id].append({"role": "user", "content": f"[User sent a video: {filename}]"})
-                        msgs.append({"role": "user", "content": user_content})
+            # --- Attachment handling (image/video) ---
+            if source_msg.attachments:
+                attachment = source_msg.attachments[0]
+                filename = attachment.filename.lower()
 
-                    else:
-                        return await message.reply("⚠️ Unsupported media type. I can analyze images and videos only.")
+                if filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    image_bytes = await attachment.read()
+                    b64 = encode_image_to_base64(image_bytes)
+                    user_content = [
+                        {"type": "text", "text": "Analyze the visual content in a methodical, clinical way. Describe subjects, behavior, surroundings, and time of day as if for evidence."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}} ,
+                    ]
+                    hist.append({"role": "user", "content": "[User sent an image for analysis]"})
+                    msgs.append({"role": "user", "content": user_content})
 
-                    result = await _chat41(msgs, max_tokens=2000, temperature=0.6)
-                    if result:
-                        channel_history[message.channel.id].append({"role": "assistant", "content": result})
-                    return await send_in_chunks(message.channel, result, reply_to=message)
+                elif filename.endswith((".mp4", ".mov", ".webm", ".gif")):
+                    path = await download_media(attachment)
+                    frames = await asyncio.to_thread(extract_frames, path, 5)
+                    if not frames:
+                        return await message.reply("❌ Could not extract frames from the video. Check file integrity.")
+                    user_content = [{"type": "text", "text": "Video sampled at ~1 FPS. Analyze clinically like evidence."}]
+                    for frame in frames:
+                        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image_to_base64(frame)}"}})
+                    hist.append({"role": "user", "content": f"[User sent a video: {filename}]"})
+                    msgs.append({"role": "user", "content": user_content})
 
-                user_text = message.content
-                channel_history[message.channel.id].append({"role": "user", "content": user_text})
-                msgs.append({"role": "user", "content": user_text})
+                else:
+                    return await message.reply("⚠️ Unsupported media type. I can analyze images and videos only.")
 
-                result = await _chat5(msgs, max_completion_tokens=2000)
+                result = await _chat41(msgs, max_tokens=2000, temperature=0.6)
+                result = (result or "").strip()
                 if result:
-                    channel_history[message.channel.id].append({"role": "assistant", "content": result})
-                await send_in_chunks(message.channel, result, reply_to=message)
+                    hist.append({"role": "assistant", "content": result})
+                return await send_in_chunks(message.channel, result, reply_to=message)
 
-            except Exception as e:
-                await message.reply(f"❌ Failed to generate reply: {e}")
+            # --- Plain text path ---
+            # Remove the bot mention from the text so it doesn’t pollute the prompt
+            user_text = source_msg.clean_content
+            user_text = re.sub(rf"^<@!?{bot.user.id}>\s*", "", user_text).strip()
+
+            hist.append({"role": "user", "content": user_text})
+            msgs.append({"role": "user", "content": user_text})
+
+            # Use the same model helper everywhere (or implement _chat5 properly)
+            result = await _chat41(msgs, max_tokens=2000, temperature=0.7)
+            result = (result or "").strip()
+            if result:
+                hist.append({"role": "assistant", "content": result})
+
+            await send_in_chunks(message.channel, result, reply_to=message)
+
+        except Exception as e:
+            await message.reply(f"❌ Failed to generate reply: {e}")
 
 # ------------------------------ Player controls ------------------------------
 
