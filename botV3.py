@@ -130,8 +130,13 @@ async def ai_chat(model: str, messages: list, **kwargs) -> str:
     def _call():
         return client.chat.completions.create(model=model, messages=messages, **kwargs)
     resp = await asyncio.to_thread(_call)
-    msg = resp.choices[0].message
-    return (getattr(msg, "content", None) or getattr(msg, "refusal", "") or "").strip() or "🤖 I couldn’t generate a reply."
+    choice = resp.choices[0]
+    text = getattr(choice.message, "content", None)
+    if not text:
+        text = getattr(choice, "text", None)  # older SDK compatibility
+    if not text:
+       logger.error(f"No content returned: {resp}")
+    return (text or "").strip() or "🤖 I couldn’t generate a reply."
 
 async def ai_tts(text: str, voice: str = TTS_VOICE, model: str = "tts-1") -> bytes:
     def _call():
