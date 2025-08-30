@@ -1184,6 +1184,29 @@ async def _clear_all_vcs(ctx: commands.Context):
     await clear_all_vcs(reason=f"Manual run by {ctx.author}")
     await ctx.send("Done.")
 
+# ------------------------------- Clear messages ---------------------------------
+
+# Replace with your restricted role ID
+ALLOWED_ROLE_ID = 1051206094506172497  
+
+@bot.command(name="clear")
+@commands.has_role(ALLOWED_ROLE_ID)  # Restricts command to users with that role
+async def clear(ctx, amount: int):
+    """Deletes X number of messages from the channel."""
+    if amount < 1:
+        return await ctx.send("⚠️ You must delete at least 1 message.")
+
+    # Bulk delete messages
+    deleted = await ctx.channel.purge(limit=amount + 1)  # +1 to also delete the command message
+    await ctx.send(f"🗑️ Deleted {len(deleted)-1} messages.", delete_after=5)
+
+# Error handler if user doesn’t have the role
+@clear.error
+async def clear_error(ctx, error):
+    if isinstance(error, commands.MissingRole):
+        await ctx.send("❌ You don’t have permission to use this command.")
+
+bot.run("YOUR_TOKEN")
 # Entry point
 if __name__ == "__main__":
     bot.run(os.getenv("DISCORD_BOT_TOKEN"))
