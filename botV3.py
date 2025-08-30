@@ -1206,7 +1206,6 @@ async def clear_error(ctx, error):
     if isinstance(error, commands.MissingRole):
         await ctx.send("❌ You don’t have permission to use this command.")
 
-bot.run("YOUR_TOKEN")
 # Entry point
 if __name__ == "__main__":
     bot.run(os.getenv("DISCORD_BOT_TOKEN"))
