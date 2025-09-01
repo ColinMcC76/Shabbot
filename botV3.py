@@ -17,12 +17,15 @@ from discord.sinks.errors import SinkException
 from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
 from openai import OpenAI
+from typing import Dict
+from contextlib import suppress
+
 
 # -----------------------------------------------------------------------------
 # Setup & Config
 # -----------------------------------------------------------------------------
 load_dotenv()
-
+_s2s_guild_locks: Dict[int, asyncio.Lock] = {}
 # Per-user short memory
 conversation_memory: dict[str, deque] = defaultdict(lambda: deque(maxlen=6))
 
@@ -35,6 +38,7 @@ intents.guilds = True
 
 # Bot
 bot = commands.Bot(command_prefix="!", intents=intents)
+SUPPORTED_VOICES = {"onyx","alloy","ash","ballad","coral","echo","sage","shimmer","verse"}
 
 # Constants
 TTS_VOICE = "onyx"
@@ -100,6 +104,24 @@ PERSONAS = {
 }
 active_persona = {"system_prompt": PERSONAS["default"]}
 
+def resolved_ffmpeg_bin() -> str:
+    # Prefer explicit env var if it points to something real
+    env = os.environ.get("FFMPEG_BIN")
+    if env and shutil.which(env):
+        return env
+    # Fall back to the earlier resolved constant (or system which)
+    return FFMPEG_BIN  # you already computed this at import time
+
+def _ffmpeg_available(bin_name: str = "ffmpeg") -> bool:
+    from shutil import which
+    return which(bin_name) is not None
+
+def _resolved_ffmpeg_bin() -> str:
+    env = os.environ.get("FFMPEG_BIN")
+    if env and (os.path.isabs(env) and os.path.exists(env) or shutil.which(env)):
+        return env
+    return FFMPEG_BIN
+
 # OpenAI (sync client; we'll offload calls with asyncio.to_thread)
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
@@ -110,6 +132,16 @@ client = OpenAI(api_key=api_key)
 # Utilities (I/O, Sessions, Helpers)
 # -----------------------------------------------------------------------------
 
+async def safe_tts(text: str) -> bytes:
+    global TTS_VOICE
+    voice = TTS_VOICE if TTS_VOICE in SUPPORTED_VOICES else "alloy"
+    try:
+        return await ai_tts(text, voice=voice)
+    except Exception:
+        if voice != "alloy":
+            # one-shot fallback if someone set an invalid voice at runtime
+            return await ai_tts(text, voice="alloy")
+        raise
 # 1) Reuse a single aiohttp ClientSession
 _AIOHTTP_SESSION: aiohttp.ClientSession | None = None
 
@@ -277,11 +309,11 @@ async def ensure_voice(ctx) -> discord.VoiceClient | None:
 @bot.command()
 async def voice(ctx, name: str = None):
     global TTS_VOICE
-    available = ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"]
+    available = sorted(SUPPORTED_VOICES)
     if not name:
         return await ctx.send(f"🎙️ Current voice: `{TTS_VOICE}`\nOptions: {', '.join(available)}")
     name = name.lower()
-    if name not in available:
+    if name not in SUPPORTED_VOICES:
         return await ctx.send(f"❌ Unknown voice. Try: {', '.join(available)}")
     TTS_VOICE = name
     await ctx.send(f"✅ Voice set to `{TTS_VOICE}`")
@@ -374,212 +406,270 @@ async def moment(ctx):
 
 # ------------------------ Equipment Check (Text + TTS) -----------------------
 @bot.command(name="equipmentchecksoundoff", aliases=["eqcso"])
-async def equipmentchecksoundoff(ctx, *, descriptor: str = None):
-    system_prompt = (
-        "You are Shabbot, a tactical squad AI trained for both military-style ops "
-        "and recreational readiness checks (wink). Your job is to write gritty, motivational, "
-        "call-to-action that match the tone of elite unit operations — but with a subtle 'nod' to 420-friendly equipment prep. Address the squad with confidence. Mention Soldier OR whatever else seems appropriate based upon {descriptor}. "
-        "Keep it short (3–5 lines), high energy, and never mention it's AI-generated."
-    )
-    user_prompt = (
-        f"Write a fresh, high-intensity mission-style Equipment Check announcement in the style of {descriptor}."
-        if descriptor else "Write a fresh, high-intensity mission-style Equipment Check announcement."
-    )
-
-    try:
-        skit = await ai_chat(
-            "gpt-5",
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            max_completion_tokens=2000,
-        )
-    except Exception:
-        skit = "**EQUIPMENT CHECK – COMMAND FAILED**\nFallback briefing activated. Check your kit manually."
-
-    await ctx.send(skit)
-
-    if not ctx.author.voice:
-        return await ctx.send("🔊 You need to be in a voice channel for me to sound off!")
-    vc: discord.VoiceClient = ctx.voice_client or await ctx.author.voice.channel.connect()
-
-    audio_bytes = await ai_tts(skit, voice=TTS_VOICE)
-    out_path = os.path.join(temp_dir, f"eqcso_{ctx.author.id}.mp3")
-    with open(out_path, "wb") as f:
-        f.write(audio_bytes)
-
-    if vc.is_playing():
-        vc.stop()
-    vc.play(discord.FFmpegPCMAudio(out_path))
-
-    def _cleanup(_err):
-        try:
-            os.remove(out_path)
-        except Exception:
-            pass
-    vc.source.after = _cleanup
-
-    await ctx.send("🗣️ Sounding off equipment check in VC!")
-
-# ----------------------------- Speech-to-Speech ------------------------------
-
-@bot.command()
-async def s2s(ctx, record_seconds: int = 5):
+async def equipmentchecksoundoff(ctx, *, descriptor: str | None = None):
     """
-    Record your mic for N seconds, transcribe, generate a short reply, and speak it.
-    Uses gpt-4.1 via _chat41 to avoid silent 'reasoning-only' completions.
+    Stateless EQCSO: generates a short, high-energy equipment check announcement
+    and plays it via TTS. No reads/writes to memory, no persona lookups.
     """
-    # --------------------- Ensure VC ---------------------
-    vc: discord.VoiceClient = ctx.guild.voice_client
-    if not vc:
+    # ---------- Preconditions ----------
+    # FFmpeg
+    if not _ffmpeg_available(_resolved_ffmpeg_bin()):
+        return await ctx.send("🧰 FFmpeg not found. Set FFMPEG_BIN or install FFmpeg on this host.")
+
+    # Voice channel
+    vc: discord.VoiceClient | None = ctx.guild.voice_client
+    if not vc or not vc.is_connected():
         if not (ctx.author.voice and ctx.author.voice.channel):
             return await ctx.send("🔊 Join a voice channel first.")
         try:
             vc = await ctx.author.voice.channel.connect()
+            # If it's a Stage Channel, try to unsuppress (ignore failures)
+            with suppress(Exception):
+                if hasattr(vc.channel, "request_to_speak"):
+                    await vc.channel.request_to_speak()
         except Exception as e:
             logger.exception("VC connect failed")
             return await ctx.send(f"❌ Could not join VC: `{e}`")
 
-    # --------------------- Record ------------------------
-    sink = SafeWaveSink()
-    finished = asyncio.Event()
-
-    async def _on_finish(_sink, _ctx):
-        finished.set()
-
-    duration = max(1, int(record_seconds))
-    await ctx.send(f"⏺️ Recording for {duration}s…")
-    try:
-        vc.start_recording(sink, _on_finish, ctx)
-    except Exception as e:
-        logger.exception("start_recording failed")
-        return await ctx.send(f"❌ start_recording failed: `{e}`")
-
-    await asyncio.sleep(duration)
-
-    try:
-        vc.stop_recording()
-    except Exception as e:
-        logger.warning("stop_recording raised: %s", e)
-        return await ctx.send("❌ I wasn’t recording—did starting fail earlier?")
-
-    try:
-        await asyncio.wait_for(finished.wait(), timeout=10)
-    except asyncio.TimeoutError:
-        logger.error("Recording finish callback timeout")
-        return await ctx.send("⏱️ Recording took too long to finalize.")
-
-    # --------------------- Extract audio -----------------
-    if not getattr(sink, "audio_data", None):
-        return await ctx.send("📝 (no speech detected)")
-
-    try:
-        _, audio_data = next(iter(sink.audio_data.items()))
-        wav_bytes = audio_data.file.getvalue()
-    except Exception as e:
-        logger.exception("Failed to read sink audio")
-        return await ctx.send(f"❌ Failed to read audio: `{e}`")
-
-    # --------------------- Transcribe --------------------
-    try:
-        text_in = await ai_transcribe(wav_bytes)
-    except Exception as e:
-        logger.exception("Transcription failed")
-        return await ctx.send(f"📝 Transcription failed: `{e}`")
-
-    if not text_in:
-        await ctx.send("📝 (no speech detected)")
-        text_in = "(No speech detected.)"
+    # ---------- Prompt (stateless) ----------
+    system_prompt = (
+        "You are Shabbot, a tactical squad AI for rapid readiness checks. "
+        "Write a gritty, motivational, 3–5 line call-to-action for an Equipment Check Sound Off. "
+        "Keep it tight, high energy, never mention AI. "
+        "Lean into elite-unit cadence; one or two punchy imperative lines are OK."
+    )
+    if descriptor:
+        user_prompt = f"Style/Theme: {descriptor}\nNow write the announcement."
     else:
-        await ctx.send(f"📝 You said: “{text_in}”")
+        user_prompt = "Write the announcement."
 
-    # --------------------- Chat reply (non-reasoning) ----
-    # Prefer _chat41 -> short, reliable text output
-    sys_prompt = active_persona["system_prompt"] + "\nKeep replies to 1–2 short sentences suitable for TTS."
+    # ---------- Generate text ----------
     try:
-        reply = await _chat41(
-            [{"role": "system", "content": sys_prompt},
-             {"role": "user", "content": text_in}],
-            max_tokens=120,  # concise on purpose
-            temperature=0.6,
+        skit = await ai_chat(
+            "gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=500,
+            temperature=1,
         )
     except Exception as e:
-        logger.exception("_chat41 failed; falling back to ai_chat gpt-5-mini")
-        # Fallback to non-reasoning gpt-5-mini if available in your account;
-        # otherwise you can change this to "gpt-4o-mini".
-        try:
-            reply = await ai_chat(
-                "gpt-5-mini",
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": text_in},
-                ],
-                max_completion_tokens=120,
-            )
-        except Exception as e2:
-            logger.exception("ai_chat fallback failed")
-            reply = ""
+        logger.exception("ai_chat failed")
+        return await ctx.send(f"❌ Text generation failed: `{e}`")
 
-    reply = (reply or "").strip()
-    if not reply:
-        reply = "I didn’t catch that. Say it one more time."
+    speak_text = (skit or "").strip()
+    if not speak_text:
+        speak_text = "Squad, gear check now. Vests strapped, comms live, mags topped. Sound off—readiness on my mark."
 
-    # --------------------- TTS synth ---------------------
+    # ---------- Synthesize TTS (uses voice fallback; still stateless) ----------
     try:
-        tts_bytes = await ai_tts(reply, voice=TTS_VOICE)
+        tts_bytes = await safe_tts(speak_text)   # uses supported voice fallback internally
     except Exception as e:
         logger.exception("TTS failed")
         return await ctx.send(f"🔇 TTS failed: `{e}`")
 
-    # --------------------- Ensure (still) connected ------
-    # Discord sometimes drops VC between synth and play; reconnect if needed.
-    if not vc or not vc.is_connected():
-        try:
-            if ctx.author.voice and ctx.author.voice.channel:
-                vc = await ctx.author.voice.channel.connect()
-            else:
-                return await ctx.send("🔇 I lost voice connection and you’re not in a channel.")
-        except Exception as e:
-            logger.exception("VC reconnect failed")
-            return await ctx.send(f"❌ Could not (re)join VC: `{e}`")
-
-    # --------------------- Play audio --------------------
+    # ---------- Write temp file ----------
     try:
-        fd, out_path = tempfile.mkstemp(prefix=f"shabbot_{ctx.author.id}_", suffix=".mp3")
+        fd, out_path = tempfile.mkstemp(prefix=f"eqcso_{ctx.author.id}_", suffix=".mp3")
         with os.fdopen(fd, "wb") as f:
             f.write(tts_bytes)
     except Exception as e:
         logger.exception("Temp file write failed")
         return await ctx.send(f"💾 Could not write audio: `{e}`")
 
-    if vc.is_playing():
-        vc.stop()
-
-    def _after_play(err: Exception | None):
-        try:
-            if err:
-                logger.error("Playback error: %s", err)
-        finally:
-            try:
-                os.remove(out_path)
-                logger.info("Cleaned temp %s", out_path)
-            except Exception as e2:
-                logger.warning("Temp cleanup failed (%s): %s", out_path, e2)
-
+    # ---------- Play ----------
     try:
+        if vc.is_playing():
+            vc.stop()
+
+        def _after_play(err: Exception | None):
+            try:
+                if err:
+                    logger.error("Playback error: %s", err)
+            finally:
+                with suppress(Exception):
+                    os.remove(out_path)
+
         source = discord.FFmpegPCMAudio(
             out_path,
-            executable=FFMPEG_BIN,
+            executable=_resolved_ffmpeg_bin(),
             before_options=FFMPEG_BEFORE,
             options=FFMPEG_OPTS,
         )
         vc.play(discord.PCMVolumeTransformer(source, volume=0.9), after=_after_play)
-        await ctx.send(f"🗣️ {reply[:180]}{'…' if len(reply) > 180 else ''}")
+        await ctx.send(f"🗣️ Equipment Check Sound Off{' — ' + descriptor if descriptor else ''}:\n```\n{speak_text}\n```")
     except Exception as e:
         logger.exception("FFmpeg playback failed")
-        try:
+        with suppress(Exception):
             os.remove(out_path)
-        except Exception:
-            pass
         await ctx.send(f"🔇 Playback failed: `{e}`")
+
+# ----------------------------- Speech-to-Speech ------------------------------
+@bot.command()
+async def s2s(ctx, record_seconds: int = 5):
+    """
+    Record your mic for N seconds, transcribe, generate a short reply, and speak it.
+    Uses gpt-4.1 via _chat41 to avoid silent 'reasoning-only' completions.
+    """
+    # ---------- Basic validation ----------
+    try:
+        duration = max(1, int(record_seconds))
+    except Exception:
+        duration = 5
+
+    if not _ffmpeg_available():
+        return await ctx.send("🧰 FFmpeg not found. Set FFMPEG_BIN or install FFmpeg on this host.")
+
+    # ---------- Concurrency guard ----------
+    lock = _s2s_guild_locks[ctx.guild.id]
+    if lock.locked():
+        return await ctx.send("⌛ Already recording in this server—try again in a moment.")
+    async with lock:
+        vc: discord.VoiceClient | None = ctx.guild.voice_client
+        # ---------- Ensure VC ----------
+        if not vc or not vc.is_connected():
+            if not (ctx.author.voice and ctx.author.voice.channel):
+                return await ctx.send("🔊 Join a voice channel first.")
+            try:
+                vc = await ctx.author.voice.channel.connect()
+            except Exception as e:
+                logger.exception("VC connect failed")
+                return await ctx.send(f"❌ Could not join VC: `{e}`")
+
+        # ---------- Record ----------
+        sink = SafeWaveSink()
+        finished = asyncio.Event()
+
+        async def _on_finish(_sink, _ctx):
+            finished.set()
+
+        await ctx.send(f"⏺ Recording for {duration}s…")
+        started_ok = False
+        try:
+            vc.start_recording(sink, _on_finish, ctx)
+            started_ok = True
+            await asyncio.sleep(duration)
+        except Exception as e:
+            logger.exception("start_recording failed")
+            return await ctx.send(f"❌ start_recording failed: `{e}`")
+        finally:
+            # Always attempt to stop, even if sleep/recording errored
+            if started_ok:
+                with suppress(Exception):
+                    vc.stop_recording()
+
+        # Wait a bit longer for flush on slow disks/CPUs
+        try:
+            await asyncio.wait_for(finished.wait(), timeout=20)
+        except asyncio.TimeoutError:
+            logger.error("Recording finish callback timeout")
+            return await ctx.send("⏱️ Recording took too long to finalize.")
+
+        # ---------- Extract audio ----------
+        if not getattr(sink, "audio_data", None):
+            return await ctx.send("📝 (no speech detected)")
+
+        try:
+            # Pick the first speaker captured
+            _, audio_data = next(iter(sink.audio_data.items()))
+            wav_bytes = audio_data.file.getvalue()
+            frames = getattr(audio_data, "frame_count", "unknown")
+        except Exception as e:
+            logger.exception("Failed to read sink audio")
+            return await ctx.send(f"❌ Failed to read audio: `{e}`")
+
+        # ---------- Transcribe ----------
+        try:
+            text_in = await ai_transcribe(wav_bytes)
+        except Exception as e:
+            logger.exception("Transcription failed")
+            return await ctx.send(f"📝 Transcription failed: `{e}`")
+
+        if not text_in:
+            await ctx.send("📝 (no speech detected)")
+            text_in = "(No speech detected.)"
+        else:
+            await ctx.send(f"📝 You said: “{text_in}”")
+
+        # ---------- Chat reply (non-reasoning) ----------
+        sys_prompt = active_persona["system_prompt"] + "\nKeep replies to 1–2 short sentences suitable for TTS."
+        try:
+            reply = await _chat41(
+                [{"role": "system", "content": sys_prompt},
+                 {"role": "user", "content": text_in}],
+                max_tokens=120,
+                temperature=0.6,
+            )
+        except Exception as e:
+            logger.exception("_chat41 failed; falling back to ai_chat gpt-5-mini")
+            try:
+                reply = await ai_chat(
+                    "gpt-5-mini",
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": text_in},
+                    ],
+                    max_tokens=120,
+                )
+            except Exception:
+                reply = ""
+
+        reply = (reply or "").strip() or "I didn’t catch that. Say it one more time."
+
+        # ---------- TTS synth ----------
+        try:
+            tts_bytes = await ai_tts(reply, voice=TTS_VOICE)
+        except Exception as e:
+            logger.exception("TTS failed")
+            return await ctx.send(f"🔇 TTS failed: `{e}`")
+
+        # ---------- Ensure (still) connected ----------
+        if not vc or not vc.is_connected():
+            try:
+                if ctx.author.voice and ctx.author.voice.channel:
+                    vc = await ctx.author.voice.channel.connect()
+                else:
+                    return await ctx.send("🔇 I lost voice connection and you’re not in a channel.")
+            except Exception as e:
+                logger.exception("VC reconnect failed")
+                return await ctx.send(f"❌ Could not (re)join VC: `{e}`")
+
+        # ---------- Play audio ----------
+        try:
+            fd, out_path = tempfile.mkstemp(prefix=f"shabbot_{ctx.author.id}_", suffix=".mp3")
+            with os.fdopen(fd, "wb") as f:
+                f.write(tts_bytes)
+        except Exception as e:
+            logger.exception("Temp file write failed")
+            return await ctx.send(f"💾 Could not write audio: `{e}`")
+
+        try:
+            if vc.is_playing():
+                vc.stop()
+
+            def _after_play(err: Exception | None):
+                try:
+                    if err:
+                        logger.error("Playback error: %s", err)
+                finally:
+                    with suppress(Exception):
+                        os.remove(out_path)
+                        logger.info("Cleaned temp %s", out_path)
+
+            source = discord.FFmpegPCMAudio(
+                out_path,
+                executable=FFMPEG_BIN,
+                before_options=FFMPEG_BEFORE,
+                options=FFMPEG_OPTS,
+            )
+            vc.play(discord.PCMVolumeTransformer(source, volume=0.9), after=_after_play)
+            await ctx.send(f"🗣️ {reply[:180]}{'…' if len(reply) > 180 else ''}")
+        except Exception as e:
+            logger.exception("FFmpeg playback failed")
+            with suppress(Exception):
+                os.remove(out_path)
+            await ctx.send(f"🔇 Playback failed: `{e}`")
 
 # ------------------------------- Speak Text ----------------------------------
 @bot.command()
@@ -634,7 +724,7 @@ async def equipmentcheck(ctx, *, descriptor: str = None):
         skit = await ai_chat(
             "gpt-5",
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            max_completion_tokens=2000,
+            max_tokens=2000,
         )
     except Exception:
         skit = "**EQUIPMENT CHECK – COMMAND FAILED**\nFallback briefing activated. Check your kit manually and await further instructions."
