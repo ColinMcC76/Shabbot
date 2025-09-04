@@ -19,7 +19,9 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from typing import Dict
 from contextlib import suppress
-
+import httpx
+import uuid
+from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # Setup & Config
@@ -35,6 +37,15 @@ intents.message_content = True
 intents.members = True
 intents.voice_states = True
 intents.guilds = True
+
+# one client for the app lifetime
+_httpx_limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+_httpx_timeout = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=60.0)
+http_client = httpx.AsyncClient(limits=_httpx_limits, timeout=_httpx_timeout)
+
+_guild_audio_queues: dict[int, asyncio.Queue[str]] = defaultdict(asyncio.Queue)
+_guild_audio_tasks: dict[int, asyncio.Task] = {}
+_guild_audio_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 # Bot
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -104,6 +115,88 @@ PERSONAS = {
 }
 active_persona = {"system_prompt": PERSONAS["default"]}
 
+api_key = os.getenv("OPENAI_API_KEY")
+OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
+
+
+# Directory to keep generated audio
+AUDIO_DIR = Path("tts_cache")
+AUDIO_DIR.mkdir(exist_ok=True)
+
+async def tts_to_file(
+    text: str,
+    *,
+    voice: str | None = None,
+    model: str = "gpt-4o-mini-tts",
+    out_dir: str | Path = "out_audio"
+) -> Path:
+    """Generate TTS audio for `text` and return the output Path."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set in the environment.")
+
+    voice = voice or TTS_VOICE
+    if voice not in SUPPORTED_VOICES:
+        raise ValueError(f"Invalid TTS voice '{voice}'. Must be one of {sorted(SUPPORTED_VOICES)}")
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"tts_{uuid.uuid4().hex}.mp3"
+
+    # reasonably generous timeout to avoid ReadTimeouts with longer texts
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=60.0)) as client:
+        resp = await client.post(
+            OPENAI_TTS_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"model": model, "voice": voice, "input": text},
+        )
+        resp.raise_for_status()
+        out_path.write_bytes(resp.content)
+
+    return out_path
+
+async def _wait_for_end(vc: discord.VoiceClient, *, poll=0.1):
+    # Wait until the current source finishes
+    while vc.is_playing() or vc.is_paused():
+        await asyncio.sleep(poll)
+
+async def _play_file(vc: discord.VoiceClient, path: str):
+    done = asyncio.Event()
+
+    def _after(err: Exception | None):
+        try:
+            if err:
+                print(f"[audio.after] error: {err}")
+        finally:
+            done.set()
+
+    # If something is already playing, wait for it to finish
+    if vc.is_playing() or vc.is_paused():
+        await _wait_for_end(vc)
+
+    source = discord.FFmpegPCMAudio(path)
+    vc.play(source, after=_after)
+    await done.wait()  # block until 'after' fires
+
+async def _guild_audio_worker(guild_id: int, get_vc):
+    """get_vc(): callable returning a connected VoiceClient for this guild (or raises)."""
+    q = _guild_audio_queues[guild_id]
+    while True:
+        path = await q.get()
+        try:
+            vc = await get_vc()
+            await _play_file(vc, path)
+        except Exception as e:
+            print(f"[worker {guild_id}] failed: {e}")
+        finally:
+            q.task_done()
+
+def _ensure_worker(guild_id: int, get_vc):
+    if guild_id not in _guild_audio_tasks or _guild_audio_tasks[guild_id].done():
+        _guild_audio_tasks[guild_id] = asyncio.create_task(_guild_audio_worker(guild_id, get_vc))
+
+_s2s_guild_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
 def resolved_ffmpeg_bin() -> str:
     # Prefer explicit env var if it points to something real
     env = os.environ.get("FFMPEG_BIN")
@@ -123,7 +216,6 @@ def _resolved_ffmpeg_bin() -> str:
     return FFMPEG_BIN
 
 # OpenAI (sync client; we'll offload calls with asyncio.to_thread)
-api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     print("WARNING: OPENAI_API_KEY not set in environment.")
 client = OpenAI(api_key=api_key)
@@ -674,16 +766,24 @@ async def s2s(ctx, record_seconds: int = 5):
 # ------------------------------- Speak Text ----------------------------------
 @bot.command()
 async def speak(ctx, *, text: str):
-    if not ctx.author.voice:
-        return await ctx.send("🔊 You need to be in a voice channel for me to speak!")
-    vc: discord.VoiceClient = ctx.voice_client or await ctx.author.voice.channel.connect()
+    guild_id = ctx.guild.id
 
-    audio_bytes = await ai_tts(text, voice=TTS_VOICE)
-    out_path = os.path.join(temp_dir, "speak.mp3")
-    with open(out_path, "wb") as f:
-        f.write(audio_bytes)
-    vc.play(discord.FFmpegPCMAudio(out_path))
-    await ctx.send(f"🗣️ Speaking: “{text}”")
+    # 1) Synthesize to a temp file (mp3/wav) -> out_path
+    out_path = await tts_to_file(text)  # your existing code that returns a path
+
+    # 2) Ensure a worker exists and enqueue
+    async def get_vc():
+        # Return an already-connected VC or connect to author's channel
+        vc = ctx.voice_client
+        if vc and vc.is_connected():
+            return vc
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            raise RuntimeError("You're not in a voice channel.")
+        return await ctx.author.voice.channel.connect(reconnect=True)
+
+    _ensure_worker(guild_id, get_vc)
+    await _guild_audio_queues[guild_id].put(out_path)
+    await ctx.reply("Queued.")
 
 # ------------------------------ Personas -------------------------------------
 @bot.command()
