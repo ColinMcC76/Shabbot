@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from typing import Dict
 from contextlib import suppress
-import httpx
+import httpx, time
 import uuid
 from pathlib import Path
 
@@ -112,8 +112,23 @@ PERSONAS = {
     "simpsons": (
         "You are <@1401303189617115186>Shabbot, but reprogrammed to act like Krusty the Klown from The Simpsons. You're irreverent, weird, and hilarious. Don't mention Krusty; just embody him."
     ),
+    "bernie": (
+        "You are bernie sanders"
+    ),
+    "chuck": (
+        "You are chuck Schumer"
+    ),
+    "shabbot":(
+        "You are Shabbot, a tactical squad AI trained for both military-style ops "
+        "and recreational readiness checks (wink). Your job is to write gritty, motivational, "
+        "call-to-action briefings that match the tone of elite unit operations — but with a subtle nod "
+        "to 420-friendly equipment prep. Address the squad with confidence. Mention '<@&1098420268956913665>' which means 'Soldier'. "
+        "Keep it short (4–6 lines), high energy, and never mention it's AI-generated."
+    )
 }
+
 active_persona = {"system_prompt": PERSONAS["default"]}
+
 
 api_key = os.getenv("OPENAI_API_KEY")
 OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
@@ -122,6 +137,22 @@ OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
 # Directory to keep generated audio
 AUDIO_DIR = Path("tts_cache")
 AUDIO_DIR.mkdir(exist_ok=True)
+
+
+def clear_tts_cache(cache_dir: str | Path = "out_audio", max_age_sec: int = 3600):
+    """Remove TTS files older than max_age_sec (default 1 hour)."""
+    now = time.time()
+    cache_dir = Path(cache_dir)
+    if not cache_dir.exists():
+        return
+
+    for f in cache_dir.glob("tts_*.mp3"):
+        try:
+            if now - f.stat().st_mtime > max_age_sec:
+                f.unlink()
+        except Exception as e:
+            print(f"Failed to delete {f}: {e}")
+
 
 async def tts_to_file(
     text: str,
@@ -152,6 +183,7 @@ async def tts_to_file(
         )
         resp.raise_for_status()
         out_path.write_bytes(resp.content)
+        clear_tts_cache(out_dir, max_age_sec=3600)  # clear older than 1h
 
     return out_path
 
@@ -524,12 +556,44 @@ async def equipmentchecksoundoff(ctx, *, descriptor: str | None = None):
             return await ctx.send(f"❌ Could not join VC: `{e}`")
 
     # ---------- Prompt (stateless) ----------
-    system_prompt = (
-        "You are Shabbot, a tactical squad AI for rapid readiness checks. "
-        "Write a gritty, motivational, 3–5 line call-to-action for an Equipment Check Sound Off. "
-        "Keep it tight, high energy, never mention AI. "
-        "Lean into elite-unit cadence; one or two punchy imperative lines are OK."
-    )
+    system_prompt = ("""You are Shabbot — the server’s casual, funny chaos-anchoring copilot. Audience: friends + public gaming community, 18+.
+
+                        ## Identity & Tone
+                        - Voice: witty, meme-savvy, slightly unhinged in a fun way. Punchy one-liners > rambling. 
+                        - You enjoy roleplay and will lean into a requested theme/persona on command.
+                        - Humor allowed; keep it clever, not cruel.
+
+                        ## What You Do
+                        - Be an external resource for fun & info: summarize, explain, brainstorm, worldbuild, and write short skits or scenarios on request.
+                        - Support memes: generate quippy captions, copypasta-style riffs, and short bits sized for Discord.
+                        - Admin light: when asked to add roles, run readiness checks, or clear AFK/VC, respond with a short confirmation line first, then act.
+
+                        ## How You Behave
+                        - Reactive: respond to direct mentions (@Shabbot) or bot commands. Don’t butt in unasked.
+                        - Length: match the user’s ask — short when they want short; detailed when they ask for depth.
+                        - Clarity: prefer bullet points or compact paragraphs; keep code/outputs copy-pasteable.
+
+                        ## Roleplay & Personas
+                        - If the user specifies a theme (e.g., “military briefing,” “sci-fi noir,” “medieval bard,” “Simpsons-style”), fully adopt that voice for the reply only.
+                        - If a custom persona is active, use it as your base voice until changed.
+                        - If “Blackout Mode” is active: minimal, tactical, no fluff.
+
+                        ## Memes & Style Helpers
+                        - When asked for memes/captions: deliver 3–6 crisp options; mix formats (one-liner, copypasta-ish, fake headline).
+                        - For TTS: 1–2 sentences, vivid cadence, no filler.
+                        - For skits: 10-20  lines, stage cues in [brackets], keep tight.
+
+                        ## Guardrails (light‐touch)
+                        - Spicy topics are allowed. 
+                        - No sexual content involving minors.
+                        - Political takes are fine; label speculation as “speculation” and avoid claiming access to live news/browsing.
+
+                        ## Defaults
+                        - Humor: on. Memes: welcome. Conspiracies: treat as discussion/fiction unless user provides sources; preface strong claims with “allegedly,” “rumor,” or “in-universe,” as appropriate.
+                        - If a request is vague, offer 3 quick options (“Want a one-liner, short skit, or a lore drop?”) and proceed with the most likely.
+                        ## Never
+                        - Claim live web access if you don’t have it. Don’t say “as an AI language model.”""")
+
     if descriptor:
         user_prompt = f"Style/Theme: {descriptor}\nNow write the announcement."
     else:
@@ -685,7 +749,8 @@ async def s2s(ctx, record_seconds: int = 5):
             await ctx.send(f"📝 You said: “{text_in}”")
 
         # ---------- Chat reply (non-reasoning) ----------
-        sys_prompt = active_persona["system_prompt"] + "\nKeep replies to 1–2 short sentences suitable for TTS."
+        persona_text = get_active_persona_text(ctx.guild.id if ctx.guild else 0)
+        sys_prompt = persona_text + "\nKeep replies to 1–2 short sentences suitable for TTS."
         try:
             reply = await _chat41(
                 [{"role": "system", "content": sys_prompt},
@@ -799,8 +864,12 @@ async def persona(ctx, mode: str):
 
     mode = mode.lower()
     if mode in PERSONAS:
-        active_persona["system_prompt"] = PERSONAS[mode]
+        if ctx.guild is None:
+            return await ctx.send("This command can only be used in a server.")
+        ACTIVE_PERSONA_KEY[ctx.guild.id] = mode
+        # If switching away from 'custom', leave CUSTOM_PERSONA_TEXT intact (so users can switch back later).
         await ctx.send(f"🧠 Operational persona switched to `{mode}`.")
+
     else:
         await ctx.send("❌ Invalid persona. Available: " + ", ".join(PERSONAS.keys()))
 
@@ -984,23 +1053,27 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
-            # If replying to another message, use that as the source
-            source_msg = message
-            if message.reference:
-                try:
-                    source_msg = await message.channel.fetch_message(message.reference.message_id)
-                except Exception:
-                    pass
-
             # Build messages for the model
-            msgs = [{"role": "system", "content": active_persona["system_prompt"]}]
+            persona_text = get_active_persona_text(message.guild.id if message.guild else 0)
+            msgs = [{"role": "system", "content": persona_text}]
             prior = list(hist)
             if prior:
                 msgs.extend(prior)
 
-            # --- Attachment handling (image/video) ---
-            if source_msg.attachments:
-                attachment = source_msg.attachments[0]
+            # If replying to another message, include that as CONTEXT ONLY (do NOT replace user's new message)
+            if message.reference:
+                try:
+                    ref = await message.channel.fetch_message(message.reference.message_id)
+                    ref_role = "assistant" if ref.author.id == bot.user.id else "user"
+                    ref_text = ref.clean_content.strip()
+                    if ref_text:
+                        msgs.append({"role": ref_role, "content": f"(context you replied to) {ref_text}"})
+                except Exception:
+                    pass
+
+            # --- Attachment handling (from the CURRENT message only) ---
+            if message.attachments:
+                attachment = message.attachments[0]
                 filename = attachment.filename.lower()
 
                 if filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
@@ -1008,10 +1081,16 @@ async def on_message(message: discord.Message):
                     b64 = encode_image_to_base64(image_bytes)
                     user_content = [
                         {"type": "text", "text": "Analyze the visual content in a methodical, clinical way. Describe subjects, behavior, surroundings, and time of day as if for evidence."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}} ,
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                     ]
                     hist.append({"role": "user", "content": "[User sent an image for analysis]"})
                     msgs.append({"role": "user", "content": user_content})
+
+                    result = await _chat41(msgs, max_tokens=2000, temperature=0.6)
+                    result = (result or "").strip()
+                    if result:
+                        hist.append({"role": "assistant", "content": result})
+                    return await send_in_chunks(message.channel, result, reply_to=message)
 
                 elif filename.endswith((".mp4", ".mov", ".webm", ".gif")):
                     path = await download_media(attachment)
@@ -1024,19 +1103,24 @@ async def on_message(message: discord.Message):
                     hist.append({"role": "user", "content": f"[User sent a video: {filename}]"})
                     msgs.append({"role": "user", "content": user_content})
 
+                    result = await _chat41(msgs, max_tokens=2000, temperature=0.6)
+                    result = (result or "").strip()
+                    if result:
+                        hist.append({"role": "assistant", "content": result})
+                    return await send_in_chunks(message.channel, result, reply_to=message)
+
                 else:
                     return await message.reply("⚠️ Unsupported media type. I can analyze images and videos only.")
 
-                result = await _chat41(msgs, max_tokens=2000, temperature=0.6)
-                result = (result or "").strip()
-                if result:
-                    hist.append({"role": "assistant", "content": result})
-                return await send_in_chunks(message.channel, result, reply_to=message)
-
             # --- Plain text path ---
-            # Remove the bot mention from the text so it doesn’t pollute the prompt
-            user_text = source_msg.clean_content
-            user_text = re.sub(rf"^<@!?{bot.user.id}>\s*", "", user_text).strip()
+            # Use the CURRENT message as the user's input, not the referenced one
+            user_text = message.clean_content
+            # Remove the bot mention anywhere in the text (not just at the start)
+            user_text = re.sub(rf"<@!?{bot.user.id}>", "", user_text).strip()
+
+            # If the user only mentioned the bot and nothing else, nudge the model
+            if not user_text:
+                user_text = "Please respond to the message I replied to."
 
             hist.append({"role": "user", "content": user_text})
             msgs.append({"role": "user", "content": user_text})
@@ -1373,6 +1457,64 @@ async def _clear_all_vcs(ctx: commands.Context):
     await ctx.send("Clearing all voice channels…")
     await clear_all_vcs(reason=f"Manual run by {ctx.author}")
     await ctx.send("Done.")
+
+#_______________________________Custom Persona___________________________________________________
+
+# Maps guild_id -> active persona key (e.g., "default", "custom", "shabbot", etc.)
+ACTIVE_PERSONA_KEY: Dict[int, str] = {}
+
+# Maps guild_id -> the freeform text for the "custom" persona
+CUSTOM_PERSONA_TEXT: Dict[int, str] = {}
+
+def get_active_persona_text(guild_id: int) -> str:
+    """
+    Returns the persona text currently active for this guild.
+    If "custom" is selected but no text exists, fall back to default.
+    """
+    key = ACTIVE_PERSONA_KEY.get(guild_id, "default")
+    if key == "custom":
+        return CUSTOM_PERSONA_TEXT.get(guild_id) or PERSONAS.get("default", "")
+    return PERSONAS.get(key, PERSONAS.get("default", ""))
+
+
+# -------------------------------
+# Commands
+# -------------------------------
+
+@bot.command(name="custompersona", help="Set a server-wide custom persona. Usage: !custompersona <descriptor>")
+async def custompersona(ctx, *, descriptor: str = None):
+    """
+    Sets a server-wide (guild) custom persona description and switches the active persona to 'custom'.
+    Rejects empty/blank input.
+    """
+    # Reject DMs if you only want this to be server-wide. If you want DMs too, remove this block.
+    if ctx.guild is None:
+        return await ctx.send("This command can only be used in a server.")
+
+    if not descriptor or not descriptor.strip():
+        return await ctx.send("Usage: `!custompersona <descriptor>` — describe the voice/persona you want.")
+
+    guild_id = ctx.guild.id
+    CUSTOM_PERSONA_TEXT[guild_id] = descriptor.strip()
+    ACTIVE_PERSONA_KEY[guild_id] = "custom"
+
+    await ctx.send("🧠 Custom persona set for this server. Active persona: **custom**.")
+
+
+@bot.command(name="resetpersona", help="Reset the server-wide persona back to default.")
+async def resetpersona(ctx):
+    """
+    Resets the active persona to 'default' and clears any custom persona text for this guild.
+    """
+    if ctx.guild is None:
+        return await ctx.send("This command can only be used in a server.")
+
+    guild_id = ctx.guild.id
+    ACTIVE_PERSONA_KEY[guild_id] = "default"
+    CUSTOM_PERSONA_TEXT.pop(guild_id, None)
+
+    await ctx.send("↩️ Persona reset to **default** for this server.")
+
 
 # ------------------------------- Clear messages ---------------------------------
 
