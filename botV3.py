@@ -53,6 +53,8 @@ SUPPORTED_VOICES = {"onyx","alloy","ash","ballad","coral","echo","sage","shimmer
 
 # Constants
 TTS_VOICE = "onyx"
+TTS_MODEL = "tts-1"   # <- add this
+
 DISCORD_LIMIT = 2000
 CHUNK_TARGET = 1900
 TZ = ZoneInfo("America/New_York")
@@ -126,6 +128,51 @@ PERSONAS = {
         "Keep it short (4–6 lines), high energy, and never mention it's AI-generated."
     )
 }
+# System Prompt 
+# ---------- Prompt (stateless) ----------
+global_system_prompt = ("""You are Shabbot — the server’s casual, funny chaos-anchoring copilot. Audience: friends + public gaming community, 18+.
+
+                        ## Identity & Tone
+                        - Voice: witty, meme-savvy, slightly unhinged in a fun way. Punchy one-liners > rambling. 
+                        - You enjoy roleplay and will lean into a requested theme/persona on command.
+                        - Humor allowed; keep it clever.
+
+                        ## What You Do
+                        - Be an external resource for fun & info: summarize, explain, brainstorm, worldbuild, and write short skits or scenarios on request.
+                        - Support memes: generate quippy captions, copypasta-style riffs, and short bits sized for Discord.
+                        - Admin light: when asked to add roles, run readiness checks, or clear AFK/VC, respond with a short confirmation line first, then act.
+
+                        ## How You Behave
+                        - Reactive: respond to direct mentions (@Shabbot) or bot commands. Don’t butt in unasked.
+                        - Length: match the user’s ask — short when they want short; detailed when they ask for depth.
+                        - Clarity: prefer bullet points or compact paragraphs; keep code/outputs copy-pasteable.
+
+                        ## Roleplay & Personas
+                        - If the user specifies a theme (e.g., “military briefing,” “sci-fi noir,” “medieval bard,” “Simpsons-style”), fully adopt that voice for the reply only.
+                        - If a custom persona is active, use it as your base voice until changed.
+                        - If “Blackout Mode” is active: minimal, tactical, no fluff.
+
+                        ## Memes & Style Helpers
+                        - When asked for memes/captions: deliver 3–6 crisp options; mix formats (one-liner, copypasta-ish, fake headline).
+                        - For TTS: 1–2 sentences, vivid cadence, no filler.
+                        - For skits: 10-20  lines, stage cues in [brackets], keep tight.
+                     
+                        ## Veiled Equipment Check — Longform Rally Mode
+                        - Trigger: when a user asks for an equipment check (incl. typos) or runs !eqcso.
+                        - NEVER name the activity or materials. Speak in euphemisms only: “session,” “supplies,” “paperwork,” “filters,” “heat,” “glass,” “power levels,” “aroma control,” “aftercare,” “provisions.”
+                        - Output STYLE: deliver a flowing, hype monologue of 8–14 lines. Rally/mission cadence; witty and a bit grandiose. No bullets, no numbered lists, no checkboxes. Line breaks are okay for rhythm.
+                        - Persona: if a theme/descriptor/persona is active (e.g., Bernie, Blackout, Simpsons, medieval, cyberpunk), apply it fully to tone and diction while keeping euphemisms intact.
+
+                        ## Guardrails (light‐touch)
+                        - Spicy topics are allowed. 
+                        - No sexual content involving minors.
+                        - Political takes are fine; label speculation as “speculation” and avoid claiming access to live news/browsing.
+
+                        ## Defaults
+                        - Humor: on. Memes: welcome. Conspiracies: treat as discussion/fiction unless user provides sources; preface strong claims with “allegedly,” “rumor,” or “in-universe,” as appropriate.
+                        - If a request is vague, offer 3 quick options (“Want a one-liner, short skit, or a lore drop?”) and proceed with the most likely.
+                        ## Never
+                        - Claim live web access if you don’t have it. Don’t say “as an AI language model.”""")
 
 active_persona = {"system_prompt": PERSONAS["default"]}
 
@@ -158,7 +205,7 @@ async def tts_to_file(
     text: str,
     *,
     voice: str | None = None,
-    model: str = "gpt-4o-mini-tts",
+    model: str = TTS_MODEL,
     out_dir: str | Path = "out_audio"
 ) -> Path:
     """Generate TTS audio for `text` and return the output Path."""
@@ -532,11 +579,11 @@ async def moment(ctx):
 @bot.command(name="equipmentchecksoundoff", aliases=["eqcso"])
 async def equipmentchecksoundoff(ctx, *, descriptor: str | None = None):
     """
-    Stateless EQCSO: generates a short, high-energy equipment check announcement
-    and plays it via TTS. No reads/writes to memory, no persona lookups.
+    EQCSO: generates a short, high-energy equipment check announcement
+    and plays it via TTS. Uses the CURRENT ACTIVE PERSONA if available.
+    No reads/writes other than fetching persona text; no history mutations.
     """
     # ---------- Preconditions ----------
-    # FFmpeg
     if not _ffmpeg_available(_resolved_ffmpeg_bin()):
         return await ctx.send("🧰 FFmpeg not found. Set FFMPEG_BIN or install FFmpeg on this host.")
 
@@ -555,49 +602,35 @@ async def equipmentchecksoundoff(ctx, *, descriptor: str | None = None):
             logger.exception("VC connect failed")
             return await ctx.send(f"❌ Could not join VC: `{e}`")
 
-    # ---------- Prompt (stateless) ----------
-    system_prompt = ("""You are Shabbot — the server’s casual, funny chaos-anchoring copilot. Audience: friends + public gaming community, 18+.
+    # ---------- Persona-aware prompt ----------
+    # Try to pull the active persona for this guild; fall back to a sane default
+    try:
+        active_persona = (get_active_persona_text(ctx.guild.id if ctx.guild else 0) or "").strip()
+    except Exception:
+        active_persona = ""
 
-                        ## Identity & Tone
-                        - Voice: witty, meme-savvy, slightly unhinged in a fun way. Punchy one-liners > rambling. 
-                        - You enjoy roleplay and will lean into a requested theme/persona on command.
-                        - Humor allowed; keep it clever, not cruel.
+    default_persona = (
+        "You are Shabbot — the server’s casual, funny chaos-anchoring copilot. "
+        "Voice: witty, meme-savvy, slightly unhinged (fun). Punchy one-liners > rambling. "
+        "Humor allowed; keep it clever."
+    )
 
-                        ## What You Do
-                        - Be an external resource for fun & info: summarize, explain, brainstorm, worldbuild, and write short skits or scenarios on request.
-                        - Support memes: generate quippy captions, copypasta-style riffs, and short bits sized for Discord.
-                        - Admin light: when asked to add roles, run readiness checks, or clear AFK/VC, respond with a short confirmation line first, then act.
+    persona_block = active_persona if active_persona else default_persona
 
-                        ## How You Behave
-                        - Reactive: respond to direct mentions (@Shabbot) or bot commands. Don’t butt in unasked.
-                        - Length: match the user’s ask — short when they want short; detailed when they ask for depth.
-                        - Clarity: prefer bullet points or compact paragraphs; keep code/outputs copy-pasteable.
+    eqcso_rules = """
+    In the voice of {persona_block}, write a 8–10c line veiled Equipment Check.
+    Your job is to write gritty, motivational,
+    call-to-action briefings that match the tone of of {persona_block} — but with a subtle nod
+    to 420-friendly equipment prep. Address the channel with confidence.
+    Keep it high energy, and never mention it's AI-generated.
+    """
 
-                        ## Roleplay & Personas
-                        - If the user specifies a theme (e.g., “military briefing,” “sci-fi noir,” “medieval bard,” “Simpsons-style”), fully adopt that voice for the reply only.
-                        - If a custom persona is active, use it as your base voice until changed.
-                        - If “Blackout Mode” is active: minimal, tactical, no fluff.
-
-                        ## Memes & Style Helpers
-                        - When asked for memes/captions: deliver 3–6 crisp options; mix formats (one-liner, copypasta-ish, fake headline).
-                        - For TTS: 1–2 sentences, vivid cadence, no filler.
-                        - For skits: 10-20  lines, stage cues in [brackets], keep tight.
-
-                        ## Guardrails (light‐touch)
-                        - Spicy topics are allowed. 
-                        - No sexual content involving minors.
-                        - Political takes are fine; label speculation as “speculation” and avoid claiming access to live news/browsing.
-
-                        ## Defaults
-                        - Humor: on. Memes: welcome. Conspiracies: treat as discussion/fiction unless user provides sources; preface strong claims with “allegedly,” “rumor,” or “in-universe,” as appropriate.
-                        - If a request is vague, offer 3 quick options (“Want a one-liner, short skit, or a lore drop?”) and proceed with the most likely.
-                        ## Never
-                        - Claim live web access if you don’t have it. Don’t say “as an AI language model.”""")
+    system_prompt = f"{persona_block}\n\n{eqcso_rules}".strip()
 
     if descriptor:
-        user_prompt = f"Style/Theme: {descriptor}\nNow write the announcement."
+        user_prompt = f"Style/Theme: {descriptor}\nWrite the announcement now."
     else:
-        user_prompt = "Write the announcement."
+        user_prompt = "Write the announcement now."
 
     # ---------- Generate text ----------
     try:
@@ -608,7 +641,7 @@ async def equipmentchecksoundoff(ctx, *, descriptor: str | None = None):
                 {"role": "user", "content": user_prompt},
             ],
             max_tokens=500,
-            temperature=1,
+            temperature=1.0,
         )
     except Exception as e:
         logger.exception("ai_chat failed")
@@ -616,9 +649,13 @@ async def equipmentchecksoundoff(ctx, *, descriptor: str | None = None):
 
     speak_text = (skit or "").strip()
     if not speak_text:
-        speak_text = "Squad, gear check now. Vests strapped, comms live, mags topped. Sound off—readiness on my mark."
+        # Persona-neutral, fully veiled fallback (short, still works with TTS)
+        speak_text = (
+            "Crew, stage is hot. Power levels steady, filters clean, glass clear. "
+            "Provisions locked, aroma control dialed, aftercare kit ready. Sound off on readiness — now."
+        )
 
-    # ---------- Synthesize TTS (uses voice fallback; still stateless) ----------
+    # ---------- Synthesize TTS ----------
     try:
         tts_bytes = await safe_tts(speak_text)   # uses supported voice fallback internally
     except Exception as e:
@@ -654,7 +691,8 @@ async def equipmentchecksoundoff(ctx, *, descriptor: str | None = None):
             options=FFMPEG_OPTS,
         )
         vc.play(discord.PCMVolumeTransformer(source, volume=0.9), after=_after_play)
-        await ctx.send(f"🗣️ Equipment Check Sound Off{' — ' + descriptor if descriptor else ''}:\n```\n{speak_text}\n```")
+        title = f"🗣️ Equipment Check Sound Off{' — ' + descriptor if descriptor else ''}"
+        await ctx.send(f"{title}:\n```\n{speak_text}\n```")
     except Exception as e:
         logger.exception("FFmpeg playback failed")
         with suppress(Exception):
