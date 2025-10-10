@@ -22,6 +22,9 @@ from contextlib import suppress
 import httpx, time
 import uuid
 from pathlib import Path
+from contextlib import suppress
+from discord.errors import NotFound
+from contextlib import suppress
 
 # -----------------------------------------------------------------------------
 # Setup & Config
@@ -31,12 +34,34 @@ _s2s_guild_locks: Dict[int, asyncio.Lock] = {}
 # Per-user short memory
 conversation_memory: dict[str, deque] = defaultdict(lambda: deque(maxlen=6))
 
+def ensure_opus_loaded() -> None:
+    if discord.opus.is_loaded():
+        return
+    # Try common names/paths on Debian/RPi
+    candidates = [
+        "/lib/aarch64-linux-gnu/libopus.so.0",
+        "/usr/lib/aarch64-linux-gnu/libopus.so.0",
+        "libopus.so.0",
+        "opus",
+    ]
+    for c in candidates:
+        with suppress(Exception):
+            discord.opus.load_opus(c)
+            if discord.opus.is_loaded():
+                return
+    raise RuntimeError(
+        "Opus not loaded. Install libopus0 & libopus-dev, then ensure the library is loadable "
+        "(try: ldconfig -p | grep opus)."
+    )
+
+
 # Intents (defined once)
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.voice_states = True
 intents.guilds = True
+ensure_opus_loaded()
 
 # one client for the app lifetime
 _httpx_limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
@@ -185,6 +210,44 @@ OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
 AUDIO_DIR = Path("tts_cache")
 AUDIO_DIR.mkdir(exist_ok=True)
 
+
+def _ffmpeg_exec() -> str:
+    env = os.getenv("FFMPEG_BIN")
+    if env and (os.path.isabs(env) and os.path.exists(env) or shutil.which(env)):
+        return env
+    return shutil.which("ffmpeg") or "/usr/bin/ffmpeg"  # last-resort path
+
+async def _ensure_stage_unsuppressed(vc: discord.VoiceClient):
+    try:
+        ch = vc.channel
+        if isinstance(ch, discord.StageChannel):
+            with suppress(Exception):
+                await ch.request_to_speak()
+            me = ch.guild.me
+            with suppress(Exception):
+                await me.edit(suppress=False)
+    except Exception:
+        pass
+
+intents = discord.Intents.default()
+intents.message_content = True           # if you use it
+intents.voice_states = True              # <-- REQUIRED for voice to work
+
+# sanity log at startup
+@bot.listen("on_ready")
+async def _intents_check():
+    ok = getattr(bot.intents, "voice_states", False)
+    logging.getLogger("shabbot.start").warning(f"voice_states intent: {ok}")
+    if not ok:
+        # make it obvious and stop the bot so we don't silently loop on 4006
+        print("FATAL: intents.voice_states=False — enable it where the Bot is created.")
+        await bot.close()
+        sys.exit(1)
+
+_VOICE_LOCKS: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+def _guild_voice_lock(guild_id: int) -> asyncio.Lock:
+    return _VOICE_LOCKS[guild_id]
 
 def clear_tts_cache(cache_dir: str | Path = "out_audio", max_age_sec: int = 3600):
     """Remove TTS files older than max_age_sec (default 1 hour)."""
@@ -489,59 +552,155 @@ async def voice(ctx, name: str = None):
     TTS_VOICE = name
     await ctx.send(f"✅ Voice set to `{TTS_VOICE}`")
 
+logger = logging.getLogger("shabbot.voice")
+
+async def _graceful_stop(vc: discord.VoiceClient):
+    """Stop playback and try to terminate ffmpeg cleanly."""
+    try:
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+        # Try to kill the underlying ffmpeg process if it’s still around
+        player = getattr(vc, "source", None)
+        inner = getattr(getattr(player, "original", player), None, None)
+    except Exception:
+        pass
+    # Best-effort: reach into FFmpegPCMAudio and terminate
+    try:
+        src = getattr(player, "original", player) if player else None
+        proc = getattr(src, "_process", None)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(asyncio.to_thread(proc.wait), 2.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+    except Exception:
+        logger.exception("Failed to terminate ffmpeg process")
+
 @bot.command()
 async def join(ctx):
     if not ctx.author.voice or not ctx.author.voice.channel:
         return await ctx.send("🔊 You need to be in a voice channel first.")
 
     target = ctx.author.voice.channel
+    lock = _guild_voice_lock(ctx.guild.id)
+    async with lock:
+        vc: discord.VoiceClient | None = ctx.voice_client
 
-    if vc := ctx.guild.voice_client:
-        if vc.is_connected():
-            return await ctx.send(f"✅ Already connected to **{vc.channel.name}**")
-        else:
-            await vc.disconnect()
-            logging.warning(f"Found stale VoiceClient in guild {ctx.guild.id}, disconnected.")
+        if vc and vc.is_connected():
+            if vc.channel.id == target.id:
+                with suppress(Exception):
+                    await _ensure_stage_unsuppressed(vc)
+                return await ctx.send(f"✅ Already connected to **{vc.channel.name}**")
+            try:
+                with suppress(Exception):
+                    await _graceful_stop(vc)
+                await vc.move_to(target)
+                with suppress(Exception):
+                    await _ensure_stage_unsuppressed(vc)
+                return await ctx.send(f"↪️ Moved to **{target.name}**")
+            except Exception:
+                with suppress(Exception):
+                    await vc.disconnect(force=True)
+                vc = None
 
-    try:
-        vc = await target.connect(timeout=20)
-    except asyncio.TimeoutError:
-        return await ctx.send("⏱ Connection timed out.")
-    except discord.ClientException as e:
-        return await ctx.send(f"🚨 Client error on connect: {e.__class__.__name__}: {e}")
-    except Exception as e:
-        return await ctx.send(f"❌ Unexpected error: {e.__class__.__name__}: {e}")
+        if vc and not vc.is_connected():
+            with suppress(Exception):
+                await vc.disconnect(force=True)
+            vc = None
 
-    if not vc or not vc.is_connected() or vc.channel != target:
-        logging.error(f"Connect reported success but VoiceClient state is bad: {vc!r}")
-        return await ctx.send("❌ I tried to join, but the connection didn’t stick. Check permissions and region.")
+        try:
+            vc = await target.connect(timeout=20, reconnect=True)
+            with suppress(Exception):
+                await _ensure_stage_unsuppressed(vc)
+        except discord.errors.ConnectionClosed as e:
+            # 4006 session invalid → fresh connect
+            if getattr(e, "code", None) == 4006:
+                vc = await _fresh_voice_connect(target)
+            else:
+                return await ctx.send(f"🚨 Voice WS closed: {getattr(e, 'code', None)}")
+        except asyncio.TimeoutError:
+            return await ctx.send("⏱ Connection timed out.")
+        except Exception as e:
+            logger.exception("Unexpected connect error")
+            return await ctx.send(f"❌ Unexpected error: {e.__class__.__name__}: {e}")
 
-    await ctx.send(f"✅ Connected to **{target.name}**")
+        if not vc or not vc.is_connected() or vc.channel.id != target.id:
+            logger.error("Connect reported success but VoiceClient state is bad: %r", vc)
+            return await ctx.send("❌ I joined, but the connection didn’t stick. Check permissions/region.")
+
+        await ctx.send(f"✅ Connected to **{target.name}**")
 
 @bot.command()
 async def leave(ctx):
-    vc = ctx.voice_client
-    if vc:
-        await vc.disconnect()
+    """Gracefully stop playback and leave the current voice channel."""
+    vc: discord.VoiceClient | None = ctx.voice_client
+    if not vc:
+        return await ctx.send("🔇 I'm not connected.")
+
+    try:
+        await _graceful_stop(vc)
+        await vc.disconnect(force=True)
         await ctx.send("👋 Disconnected.")
-    else:
-        await ctx.send("🔇 I'm not connected.")
+    except Exception as e:
+        logger.exception("Leave failed")
+        await ctx.send(f"⚠️ Tried to disconnect but hit an error: {e.__class__.__name__}")
+
 
 # --------------------------- Quick SFX ---------------------------------------
+async def _fresh_voice_connect(channel: discord.VoiceChannel):
+    # fully dispose any existing VoiceClient for this guild
+    vc = channel.guild.voice_client
+    if vc:
+        with suppress(Exception):
+            await vc.disconnect(force=True)
+
+    # connect cleanly
+    vc = await channel.connect(timeout=20, reconnect=True)
+    with suppress(Exception):
+        await _ensure_stage_unsuppressed(vc)
+    return vc
+
+
 async def _play_file_in_vc(ctx, path: str):
-    if ctx.author.voice is None:
+    if not getattr(ctx.author, "voice", None) or not ctx.author.voice.channel:
         return await ctx.send("❌ You must be in a voice channel.")
-    channel = ctx.author.voice.channel
-    vc = ctx.voice_client
-    if vc is None:
-        vc = await channel.connect()
-    elif vc.channel != channel:
-        await vc.move_to(channel)
-    try:
-        source = discord.FFmpegPCMAudio(path)
-        vc.play(source)
-    except Exception as e:
-        await ctx.send(f"❌ Could not play sound: {e}")
+
+    guild_id = ctx.guild.id
+    lock = _guild_voice_lock(guild_id)
+    async with lock:
+        channel: discord.VoiceChannel = ctx.author.voice.channel
+        vc: discord.VoiceClient | None = ctx.voice_client
+
+        try:
+            if vc is None:
+                try:
+                    vc = await channel.connect(timeout=20, reconnect=True)
+                except discord.errors.ConnectionClosed as e:
+                    if getattr(e, "code", None) == 4006:
+                        vc = await _fresh_voice_connect(channel)
+                    else:
+                        raise
+            elif vc.channel.id != channel.id:
+                with suppress(Exception):
+                    if vc.is_playing():
+                        vc.stop()
+                await vc.move_to(channel)
+        except asyncio.TimeoutError:
+            return await ctx.send("⏱ Voice connection timed out. Try again.")
+        except Exception as e:
+            return await ctx.send(f"🚨 Voice connect error: {e.__class__.__name__}: {e}")
+
+        await _ensure_stage_unsuppressed(vc)
+        with suppress(Exception):
+            if vc.is_playing():
+                vc.stop()
+
+        try:
+            source = discord.FFmpegPCMAudio(path, executable=_ffmpeg_exec())
+            vc.play(source)
+        except Exception as e:
+            return await ctx.send(f"❌ Could not play sound: {e}")
 
 @bot.command()
 async def play(ctx, sound: str):
@@ -911,10 +1070,11 @@ async def persona(ctx, mode: str):
     else:
         await ctx.send("❌ Invalid persona. Available: " + ", ".join(PERSONAS.keys()))
 
-# --------------------------- Equipment Check w/ Timer ------------------------
 @bot.command(name="equipmentcheck", aliases=["eqc"])
 async def equipmentcheck(ctx, *, descriptor: str = None):
-    await ctx.message.delete()
+    with suppress(Exception):
+        await ctx.message.delete()
+
     system_prompt = (
         "You are Shabbot, a tactical squad AI trained for both military-style ops "
         "and recreational readiness checks (wink). Your job is to write gritty, motivational, "
@@ -924,17 +1084,33 @@ async def equipmentcheck(ctx, *, descriptor: str = None):
     )
     user_prompt = (
         f"Write a fresh, high-intensity mission-style Equipment Check announcement in the style of {descriptor}."
-        if descriptor else "Write a fresh, high-intensity mission-style Equipment Check announcement."
+        if descriptor else
+        "Write a fresh, high-intensity mission-style Equipment Check announcement."
     )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
+    ]
 
     try:
-        skit = await ai_chat(
-            "gpt-5",
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            max_tokens=2000,
+        # call GPT-4.1 directly
+        resp = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model="gpt-4.1",
+                messages=messages,
+                max_completion_tokens=300,
+            )
         )
+        choice = resp.choices[0]
+        skit = (getattr(choice.message, "content", None) or "").strip()
     except Exception:
-        skit = "**EQUIPMENT CHECK – COMMAND FAILED**\nFallback briefing activated. Check your kit manually and await further instructions."
+        logging.exception("equipmentcheck -> gpt-4.1 call failed")
+        skit = ("**EQUIPMENT CHECK – COMMAND FAILED**\n"
+                "Fallback briefing activated. Check your kit manually and await further instructions.")
+
+    skit = (skit or "").strip()
+    if len(skit) > 1800:
+        skit = skit[:1799] + "…"
 
     total = 5 * 60
     sent_msg = await ctx.send(f"{skit}\n\n⏱ Time remaining: 05:00")
@@ -943,10 +1119,13 @@ async def equipmentcheck(ctx, *, descriptor: str = None):
     confirmed_users: set[discord.Member] = set()
 
     def reaction_check(reaction, user):
-        return reaction.message.id == sent_msg.id and str(reaction.emoji) == "✅" and not user.bot
+        return (
+            reaction.message.id == sent_msg.id
+            and str(reaction.emoji) == "✅"
+            and not getattr(user, "bot", False)
+        )
 
     async def countdown_timer():
-        # Update every 5 seconds to reduce rate-limit pressure
         for remaining in range(total - 5, -5, -5):
             await asyncio.sleep(5)
             minutes = max(0, remaining) // 60
@@ -955,10 +1134,8 @@ async def equipmentcheck(ctx, *, descriptor: str = None):
                 await sent_msg.edit(content=f"{skit}\n\n⏱ Time remaining: {minutes:02}:{seconds:02}")
             except NotFound:
                 return
-        try:
+        with suppress(NotFound):
             await sent_msg.edit(content=f"{skit}\n\n⏱ Time's up. Lock in or fall out.")
-        except NotFound:
-            pass
 
     async def gather_reactions():
         while not countdown_task.done():
@@ -966,6 +1143,10 @@ async def equipmentcheck(ctx, *, descriptor: str = None):
                 reaction, user = await bot.wait_for("reaction_add", timeout=5.0, check=reaction_check)
                 if isinstance(user, discord.Member):
                     confirmed_users.add(user)
+                elif ctx.guild:
+                    m = ctx.guild.get_member(user.id)
+                    if m:
+                        confirmed_users.add(m)
             except asyncio.TimeoutError:
                 continue
 
@@ -980,16 +1161,19 @@ async def equipmentcheck(ctx, *, descriptor: str = None):
     if not ready_role:
         return await ctx.send("⚠️ 'Equipped' role not found.")
 
-    for member in guild.members:
-        if member.bot:
-            continue
-        try:
-            if member in confirmed_users and ready_role not in member.roles:
-                await member.add_roles(ready_role)
-            elif member not in confirmed_users and ready_role in member.roles:
-                await member.remove_roles(ready_role)
-        except Exception:
-            pass
+    me = guild.me
+    if not me.guild_permissions.manage_roles or me.top_role <= ready_role:
+        return await ctx.send("⚠️ I need **Manage Roles**, and my top role must be above **Equipped**.")
+
+    for m in confirmed_users:
+        if ready_role not in m.roles:
+            with suppress(Exception):
+                await m.add_roles(ready_role, reason="Equipment Check confirmed")
+
+    current = set(ready_role.members)
+    for m in (current - confirmed_users):
+        with suppress(Exception):
+            await m.remove_roles(ready_role, reason="Equipment Check not confirmed")
 
     if confirmed_users:
         mentions = ", ".join(u.mention for u in confirmed_users)
@@ -1048,7 +1232,8 @@ async def _chat5(messages, *, max_completion_tokens=2000, temperature=0.7) -> st
 async def chat5_complete(messages, *, max_completion_tokens=1200, max_rounds=2) -> str:
     full = ""
     rounds = 0
-    msgs = messages[:]
+    msgs = messages[:]  # copy so we can mutate safely
+
     while True:
         def _call():
             return client.chat.completions.create(
@@ -1056,17 +1241,36 @@ async def chat5_complete(messages, *, max_completion_tokens=1200, max_rounds=2) 
                 messages=msgs,
                 max_completion_tokens=max_completion_tokens,
             )
+
+        # run the blocking call in a thread so it doesn’t block the event loop
         resp = await asyncio.to_thread(_call)
+
         choice = resp.choices[0]
         text = (getattr(choice.message, "content", None) or "").strip()
-        full += (("\n" if full else "") + (text or ""))
+        if text:
+            full += ("\n" if full else "") + text
+
+        # stop if not cut off for length, or if we’ve already looped too many times
         if getattr(choice, "finish_reason", "stop") != "length" or rounds >= max_rounds:
             break
+
         rounds += 1
-        msgs += [{"role": "assistant", "content": text or ""}, {"role": "user", "content": "Continue."}]
+        # continue conversation with assistant output and a “Continue.” user message
+        msgs += [
+            {"role": "assistant", "content": text or ""},
+            {"role": "user", "content": "Continue."},
+        ]
+
+    # fallback: if GPT-5 returned nothing usable, try gpt-5-mini instead
     if not full.strip():
-        return await ai_chat("gpt-5-mini", messages=messages, max_completion_tokens=max_completion_tokens)
+        return await ai_chat(
+            "gpt-5-mini",
+            messages=messages,
+            max_completion_tokens=max_completion_tokens,
+        )
+
     return full
+
 
 @bot.command()
 async def forget(ctx):
